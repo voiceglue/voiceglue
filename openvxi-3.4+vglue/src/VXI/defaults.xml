@@ -1,0 +1,142 @@
+<?xml version="1.0" ?>
+
+<!--
+Vocalocity OpenVXI
+Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered trademarks of Vocalocity, Inc. 
+OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.
+-->
+
+<!DOCTYPE defaults PUBLIC "SB_Defaults" "ignore" >
+<defaults xml:lang="en">
+  <language id="*"> <!-- All languages -->
+    <!-- 6.3.5 Fetching properties -->
+    <property name='audiofetchhint'    value='prefetch'/>
+    <property name='documentfetchhint' value='safe'/>
+    <property name='grammarfetchhint'  value='prefetch'/>
+    <property name='objectfetchhint'   value='prefetch'/>
+    <property name='scriptfetchhint'   value='prefetch'/>
+    <property name='datafetchhint'     value='prefetch'/>
+    <!-- property name='fetchaudio'    value=''/ (i.e.defaults to none) -->
+    <property name='fetchaudiodelay'   value='2s'/>
+    <property name='fetchaudiominimum' value='5s'/>
+    <property name='fetchtimeout'      value='7s'/>
+
+    <!-- 6.3.6 Miscellaneous Properties -->
+    <property name='inputmodes'        value='dtmf voice'/>
+    <property name='universals'        value='none'/>
+    <property name='maxnbest'          value='1'/>
+
+    <!-- implement the default handlers as defined in 11.5 -->
+    <property name='confidencelevel'   value='0.5'/>
+    <property name='sensitivity'       value='0.5'/>
+    <property name='speedvsaccuracy'   value='0.5'/>
+    <property name='termtimeout'       value='0s'/>
+    <property name='termchar'          value='#'/>
+    <property name='bargein'           value='true'/>
+    <property name='bargeintype'       value='speech'/>
+
+    <!-- OSR 2.0 and beyond adds extra nbest keys by default
+         to the NLSML result. Adding this parameter will
+	 disable those keys. This eliminates the need to edit
+	 OSR's baseline.xml. The extra nbest keys will cause
+	 the field variable to contain a map of values rather
+	 than a single value for a standard grammar. Other
+	 recognizers should ignore this value.
+      -->
+    <property name="swirec_extra_nbest_keys" value=""/>
+
+    <catch event='cancel'> <!-- do nothing -->
+    </catch>
+
+    <error>
+      <if cond='_message != undefined'>
+        <log>Default error handler: <value expr='_event'/>, <value expr='_message'/></log>
+      <else/>
+        <log>Default error handler: <value expr='_event'/></log>
+      </if>
+      A serious error has occured.  Exiting. <exit/>
+    </error>
+
+    <catch event='exit'> <exit/>
+    </catch>
+
+    <help>
+      <prompt xml:lang="en">Context specific help is unavailable.</prompt>
+      <reprompt/>
+    </help>
+
+    <help count='5'><exit/>
+    </help>
+
+    <noinput count='1'>
+      <reprompt/>
+    </noinput>
+
+    <noinput count='2'>
+      <prompt xml:lang="en">Sorry, I didn't hear you.</prompt>
+      <reprompt/>
+    </noinput>
+
+    <noinput count='3'>
+      <prompt xml:lang="en">I didn't hear you that time either.</prompt>
+      <reprompt/>
+    </noinput>
+
+    <noinput count='4'>
+      <prompt xml:lang="en">I just can't hear you.</prompt>
+      <reprompt/>
+    </noinput>
+
+    <noinput count='5'><exit/>
+    </noinput>
+
+    <nomatch count='1'>
+      <prompt xml:lang="en">Sorry, I didn't understand you.</prompt>
+      <reprompt/>
+    </nomatch>
+
+    <nomatch count='2'>
+      <prompt xml:lang="en">I still don't understand.</prompt>
+      <reprompt/>
+    </nomatch>
+
+    <nomatch count='3'>
+      <prompt xml:lang="en">Please say it one last time.</prompt>
+      <reprompt/>
+    </nomatch>
+
+    <nomatch count='4'>
+      <prompt xml:lang="en">I'm sorry. I just can't understand your 
+         response.</prompt>
+      <exit/>
+    </nomatch>
+
+    <catch event='connection.disconnect'> <exit/>
+    </catch>
+
+    <catch>
+      <if cond='_message != undefined'>
+        <log>Default event handler: <value expr='_event'/>, <value expr='_message'/></log>
+      <else/>
+        <log>Default event handler: <value expr='_event'/></log>
+      </if>
+      <prompt xml:lang="en">An application error occured.  Exiting.</prompt>
+      <exit/>
+    </catch>
+
+  </language>
+</defaults>

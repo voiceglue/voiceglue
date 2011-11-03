@@ -1,0 +1,14 @@
+Build.PL
+Changes
+MANIFEST
+META.yml # Will be created by "make dist"
+README
+COPYING
+lib/Satc.pm
+lib/Satc.xs
+t/00-load.t
+t/boilerplate.t
+t/pod-coverage.t
+t/pod.t
+t/satc-c-funcs.t
+t/satc-perl-funcs.t

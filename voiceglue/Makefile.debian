@@ -1,0 +1,56 @@
+##  Copyright 2006,2007 Ampersand Inc., Doug Campbell
+##
+##  This file is part of voiceglue.
+##
+##  voiceglue is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  voiceglue is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with voiceglue; if not, see <http://www.gnu.org/licenses/>.
+
+SHELL = /bin/sh
+RM = rm -f
+INSTALL = install
+
+install:
+	./voiceglue_init_config
+	$(INSTALL) voiceglue /usr/bin
+	$(INSTALL) voiceglue.init /etc/init.d/voiceglue
+	if [ ! -f /usr/bin/voiceglue_tts_gen ] ; then $(INSTALL) voiceglue_tts_gen /usr/bin  ; fi
+	/bin/rm -r -f /etc/rc0.d/K57voiceglue
+	/bin/rm -r -f /etc/rc1.d/K57voiceglue
+	/bin/rm -r -f /etc/rc2.d/S93voiceglue
+	/bin/rm -r -f /etc/rc3.d/S93voiceglue
+	/bin/rm -r -f /etc/rc4.d/S93voiceglue
+	/bin/rm -r -f /etc/rc5.d/S93voiceglue
+	/bin/rm -r -f /etc/rc6.d/K57voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc0.d/K57voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc1.d/K57voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc2.d/S93voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc3.d/S93voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc4.d/S93voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc5.d/S93voiceglue
+	ln -s /etc/init.d/voiceglue /etc/rc6.d/K57voiceglue
+
+uninstall:
+	/etc/init.d/voiceglue stop > /dev/null 2>&1
+	/bin/rm -r -f /etc/rc0.d/K57voiceglue
+	/bin/rm -r -f /etc/rc1.d/K57voiceglue
+	/bin/rm -r -f /etc/rc2.d/S93voiceglue
+	/bin/rm -r -f /etc/rc3.d/S93voiceglue
+	/bin/rm -r -f /etc/rc4.d/S93voiceglue
+	/bin/rm -r -f /etc/rc5.d/S93voiceglue
+	/bin/rm -r -f /etc/rc6.d/K57voiceglue
+	$(RM) /usr/bin/voiceglue
+	$(RM) /usr/bin/voiceglue_tts_gen
+	$(RM) /etc/init.d/voiceglue
+
+clean:
+	$(RM) *.o *.so

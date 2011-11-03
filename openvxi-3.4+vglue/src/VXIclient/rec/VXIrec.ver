@@ -1,0 +1,15 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		VXIrecCreateResource
+;
+		VXIrecDestroyResource
+;
+		VXIrecInit
+;
+		VXIrecShutDown
+;
+	local:
+	  *;
+	};
+}

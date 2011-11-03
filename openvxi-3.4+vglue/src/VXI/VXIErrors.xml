@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+
+<!--
+Vocalocity OpenVXI
+Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered trademarks of Vocalocity, Inc. 
+OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.
+-->
+
+<ErrorMessages moduleName="*.vxi">
+  <error num='201' severity='1'>VXIinterpreterRun: Invalid parameter for URI.</error>
+  <error num='202' severity='1'>VXIinterpreterRun: Unable to allocate memory.</error>
+  <error num='203' severity='1'>VXIinterpreterRun: Failed to open</error>
+  <error num='204' severity='1'>VXIinterpreterRun: Failed to read the URI's content.</error>
+  <error num='205' severity='1'>VXIinterpreterRun: Failed to parse the URI's content.
+    <advice>Make sure that this document consists of valid VXML.</advice></error>
+  <error num='206' severity='2'>VXIinterpreterRun: Internal error (Unexpected return value during parsing).
+    <advice>Contact Vocalocity technical support.</advice></error>
+  <error num='207' severity='2'>VXIinterpreterRun: Unhandled exception</error>
+  <error num='208' severity='2'>VXIinterpreterRun: Unable to open the URI with the specified encoding</error>
+  <error num='209' severity='2'>VXIinterpreterRun: Function aborted due to fatal error.
+    <advice>This message should be preceeded by one or more error messages explaining why this occurred.</advice></error>
+  <error num='210' severity='1'>VXIinterpreterRun: Maximum documents count exceeded.
+    <advice>There is probably an infinite loop of in your VXML document.</advice></error>
+  <error num='211' severity='1'>VXIinterpreterRun: Maximum depth exceeded.
+    <advice>This may be caused by circular references in &lt;subdialog&gt;</advice></error>
+  <error num='212' severity='1'>VXIinterpreterRun: Severe error encountered during ECMA script interpretation.</error>
+  <error num='213' severity='1'>VXIinterpreterRun: The telephony layer could not successfully disconnect.</error>
+  <error num='214' severity='2'>VXIinterpreterRun: The application URI cannot include a fragment.
+    <advice>The URI had the form &quot;uri-string#fragment&quot;.  Fragments are not allowed.</advice></error>
+  <error num='215' severity='2'>VXIinterpreterRun: The grammar URI cannot include a fragment.  The fragment was ignored.
+    <advice>The URI had the form &quot;uri-string#fragment&quot;.  Fragments are not allowed.</advice></error>
+  <error num='216' severity='1'>VXIinterpreterRun: Maximum loop count exceeded.
+    <advice>There is probably an infinite loop of in your VXML document.</advice></error>
+  <error num='217' severity='2'>VXIinterpreterRun: Duplicate form item name.
+    <advice>Form item names must be unique.</advice></error>
+  <error num='218' severity='2'>VXIinterpreterRun: &lt;param&gt; elements passed to a &lt;subdialog&gt; must have corresponding &lt;var&gt; elements.
+    <advice>Make sure that there is a var for each specified param.</advice></error>
+  <error num='219' severity='2'>VXIinterpreterRun: &lt;var&gt; names cannot contain periods or scope prefixes.</error>
+    
+  <error num='220' severity='1'>VXIinterpreterRun: Invalid argument for platform defaults location.</error>
+  <error num='221' severity='1'>VXIinterpreterRun: Unable to parse platform defaults due to an exception.</error>
+  <error num='223' severity='1'>VXIinterpreterRun: Unable to parse platform defaults due to 
+  an error.semantic.missing_generic_defaults exception.</error>
+  <error num='224' severity='3'>VXIinterpreterRun: invalid maxnbest value, deliberately set to 1.</error>
+
+  <error num='225' severity='1'>VXIinterpreterRun: Could not locate form on local jump.</error>
+
+  <error num='400' severity='1'>VXIinterpreterRun: The VXIvalue::VXIVector implementation appears broken.
+    <advice>Contact the provider of the VXIvalue library.</advice></error>
+
+  <error num='410' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_RAW contents must be all strings.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='411' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_CONF contents must be all floats.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='412' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_KEYS contents must be all strings.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='413' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_VALUES must be non-null.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='414' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_VALUES contents have illegal type.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='415' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: unable to extract single key from interpretations.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='416' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken: REC_KEY contents not all unique.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+
+  <error num='420' severity='1'>VXIinterpreterRun: The VXIrecInterface::Recognize function appears broken.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='421' severity='1'>VXIinterpreterRun: The VXIrecInterface::Record function appears broken.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+
+  <error num='430' severity='1'>VIXinterpreterRun: The VXIrecInterface::Recognize function returned a result with an unsupported type.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='431' severity='1'>VIXinterpreterRun: The VXIrecInterface::Recognize function returned an empty result.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='432' severity='1'>VIXinterpreterRun: The VXIrecInterface::Recognize function returned an invalid result.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+  <error num='433' severity='1'>VIXinterpreterRun: The VXIrecInterface::Recognize result did not contain a valid grammar.
+    <advice>Contact the provider of the VXIrecInterface.</advice></error>
+
+  <error num='440' severity='1'>VXIinterpreterRun: The VXItelInterface::TransferBlind function appears broken.
+    <advice>Contact the provider of the VXItelInterface.</advice></error>
+  <error num='441' severity='1'>VXIinterpreterRun: The VXItelInterface::TransferBridge function appears broken.</error>
+  <error num='442' severity='1'>VXIinterpreterRun: The VXItelInterface::GetStatus function appears broken.
+    <advice>Contact the provider of the VXItelInterface.</advice></error>
+
+  <error num='460' severity='1'>VXIinterpreterRun: The VXIobjectInterface::Execute function appears broken.
+    <advice>Contact the provider of the VXIobjectInterface.</advice></error>
+
+  <error num='990' severity='2'>VXIinterpreterRun: Internal error: unable to create file for page dump.
+    <advice>Contact the provider of the VXIinterpreterInterface.</advice></error>
+  <error num='999' severity='2'>VXIinterpreterRun: Internal error.
+    <advice>Contact the provider of the VXIinterpreterInterface.</advice></error>
+
+</ErrorMessages>

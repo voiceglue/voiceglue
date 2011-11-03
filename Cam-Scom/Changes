@@ -1,0 +1,11 @@
+Revision history for Cam-Scom
+
+0.04    May 27, 2007
+	Packaged for public release with Voiceglue
+
+0.03    Dec. 18, 2006
+	Added -3 term code for EBADF on select() result
+	instead of a die()
+
+0.01    Oct. 28, 2006
+        First Build-packaged version

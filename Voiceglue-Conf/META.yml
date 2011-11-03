@@ -1,0 +1,20 @@
+---
+name: Voiceglue-Conf
+version: 0.01
+author:
+  - 'Doug Campbell <voiceglue@voiceglue.org>'
+abstract: Support for reading/writing voiceglue.conf file
+license: gpl
+resources:
+  license: http://www.opensource.org/licenses/gpl-license.php
+build_requires:
+  Satc: 0
+  Test::More: 0
+provides:
+  Voiceglue::Conf:
+    file: lib/Voiceglue/Conf.pm
+    version: 0.01
+generated_by: Module::Build version 0.2808
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2

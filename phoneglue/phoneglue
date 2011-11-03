@@ -1,0 +1,5043 @@
+#!/usr/bin/perl --           -*-CPerl-*-
+
+##  Copyright 2006-2010 Ampersand Inc., and Doug Campbell
+##
+##  This program is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  This program is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with this program; if not, see <http://www.gnu.org/licenses/>.
+
+=head1 NAME
+
+phoneglue - an Asterisk <-> SATC translator
+
+=head1 VERSION
+
+Version 0.10
+
+=cut
+
+our $VERSION = '0.10';
+
+=head1 USAGE
+
+ phoneglue [-mgrhost host] [-mgrport port]
+	   [-mgruser user] [-mgrpasswd passwd]
+	   [-asthost host] [-agiport port]
+	   [-vamdhost host] [-vamdport port]
+	   [-ctport port] [-bindhost host] [-U user] [-G group] [-fg]
+	   [-loghost host] [-loglevel level] [-logdir dir]
+
+	-mgrhost is host of the Asterisk manager (default: localhost)
+	-mgrport is the port of the Asterisk manager (default: 5038)
+	-mgruser is the Aterisk manager username (default: phoneglue)
+	-mgrpasswd is the Aterisk manager password (default: phoneglue)
+	-asthost is the asterisk host (default: same as -mgrhost)
+	-agiport is the FastAGI port to listen on (default: 4573)
+	-vamdhost and -vamdport specify how to connect to the vamd
+	-ctport is the SATC port to listen on (default: 44647)
+	-bindhost is the SATC host address to listen on (default: all)
+        -U user is the user to run as, -G group is the group to run as
+        -fg means to run in the forground (normally becomes daemon)
+	-loghost is the dynlog host (optional) to send logs to
+	-loglevel is the loglevel to use, 0-7 (same as syslog)
+	-logdir is the log file directory; - means log to STDOUT
+
+
+=head1 DESCRIPTION
+
+Asterisk is an open source, GPLed telephony software suite.
+SATC stands for Simple ASCII Telephony Control.
+SATC is a simple ASII protocol
+that provides call control and media control of multiple
+telephone calls simultaneously, both inbound and outbound.
+Phoneglue is a SATC server exposing Asterisk telephony via SATC.
+The phoneglue program, when started, first opens
+a connection to the Asterisk Manager interface.
+It then awaits a connection to the SATC port by clients
+using the SATC protocol.
+Individual calls are presented to phoneglue for control
+by Asterisk connecting
+to a phoneglue port using the FastAGI protocol.
+
+=head1 CONFIGURATION
+
+The phoneglue program can run on the same host as
+Asterisk or on a different host.  This choice has
+little performance impact on Asterisk or phoneglue,
+but of course putting them both on the same host
+combines their load on that host.
+
+Audio file paths presented to SATC are interpreted
+by Asterisk relative to the Asterisk host.
+The -asthost parameter is not used for establishing any connectivity,
+it is only provided in messages to SATC clients to let them know where
+Asterisk-recorded files reside.  In cases where phoneglue runs on a
+different host from asterisk it is recommended that a shared
+filesystem be used to extract recorded audio files and to
+create new audio prompt files.
+
+In order to make outbound calls or use stopmedia commands,
+there must be an Asterisk context, extension, and priority
+reserved for each unique phoneglue client.
+These values are defined by each client's Satc "start" request.
+A matching entry in asterisk's extensions.conf must look like this:
+
+  [<context>]
+  exten => <extension>,<priority>,Agi(agi://localhost)
+  exten => <extension>,<priority+1>,Hangup
+
+The hangup in the dialplan above is optional, but
+it avoids the extension-press timeout delay that
+will happen after phoneglue releases a call.
+
+=cut
+
+use Config;
+use Carp;
+use Data::Dumper;
+use Sys::Hostname;
+use POSIX qw(ceil setsid);
+use Time::HiRes qw(gettimeofday);
+use BSD::Resource;
+use URI::Escape;
+use Cam::Scom;
+use Cam::Scom::Event;
+use Satc;
+
+use bytes;
+use strict;
+
+#################################################################
+##  Tunables
+$::AGI_port = 4573;          ##  FastAGI incoming port: 4573 is the default
+$::MGR_host = "localhost";   ##  Host of asterisk manager
+$::MGR_port = 5038;          ##  Asterisk manager port: 5038 is the default
+$::MGR_user = "phoneglue";   ##  Asterisk manager login user
+$::MGR_passwd = "phoneglue"; ##  Asterisk manager login password
+$::VAMD_host = "localhost";  ##  Host for VAMD
+$::VAMD_port = 44668;	     ##  Port for VAMD
+$::CT_port = 44647;          ##  SATC client incoming port: 44647 is default
+$::CT_host = undef;	     ##  CT host to bind listens to (undef = all)
+
+
+#################################################################
+##  Logging setup
+$::Log_dir = "/var/log/phoneglue";
+$::Log_fh = "::LOG";
+$::Max_log_file_size = 100000000;
+$::Number_of_previous_kept = 2;
+$::Loghost = undef;                          ##  Dynlog host to use if defined
+$::Time_of_next_connect_to_log_server = 0;   ##  If non-0, failed to connect
+$::Loglevel = 7;                             ##  Log level until told otherwise
+$::Dynlog_Mythread = sprintf ("%-8.8s", hostname() ."--------");
+$::Dynlog_Mymodule = "PHONGLUE";
+@::Msg_level_strings =
+  ("EMRG", "ALRT", "CRIT", "EROR", "WARN", "NOTI", "INFO", "DBUG");
+use constant LOG_EMRG => 0;
+use constant LOG_ALRT => 1;
+use constant LOG_CRIT => 2;
+use constant LOG_EROR => 3;
+use constant LOG_WARN => 4;
+use constant LOG_NOTI => 5;
+use constant LOG_INFO => 6;
+use constant LOG_DBUG => 7;
+
+
+#################################################################
+##  Globals
+$::AstMgrFh = "::ASTMGR";
+$::AstMgrInfo = {};          ##  Shortcut to $::Fh_to_clientobj->{$::AstMgrFh}
+$::VAMDFh = "::VAMD";
+$::VAMDInfo = {};            ##  Shortcut to $::Fh_to_clientobj->{$::VAMDFh}
+$::VAMD_Available = 0;
+$::Scom = undef;
+$::Next_callid = 1;
+
+$::AstSoundFileExtensions = {
+			     "ogg" => 1,
+			     "g729" => 1,
+			     "g723" => 1,
+			     "g723sf" => 1,
+			     "h264" => 1,
+			     "wav" => 1,
+			     "vox" => 1,
+			     "h263" => 1,
+			     "slin" => 1,
+			     "raw" => 1,
+			     "g726-16" => 1,
+			     "g726-24" => 1,
+			     "g726-32" => 1,
+			     "g726-40" => 1,
+			     "gsm" => 1,
+			     "g722" => 1,
+			     "au" => 1,
+			     "alaw" => 1,
+			     "al" => 1,
+			     "pcm" => 1,
+			     "ulaw" => 1,
+			     "ul" => 1,
+			     "mu" => 1,
+			     "wav49" => 1,
+			     "ilbc" => 1,
+			     };
+$::AstSoundFileExtenRegex = join ("|", keys (%$::AstSoundFileExtensions));
+
+##  Entities and their relationships:
+##    Asterisk UniqueIDs and SATC callids (one per call)
+##    CT client filehandles (one per CT client)
+##    AGI filehandles (one per call)
+##
+##  The UniqueID and callid are invariant for a call.
+##  The AGI filehandle can be attached to a CT client call or not.
+##  The CT client filehandle be attached to AGI calls or not.
+##  CT client filehandles are associated with AGI filehandles through calls.
+
+$::Callid_to_callobj = {};
+$::Uniqueid_to_callobj = {};
+##  Map callids and uniqueids to Call objects (callobj's)
+##    ->{"callid"}         -- the callid (internal)
+##    ->{"uniqueid"}       -- the uniqueid from Asterisk
+##    ->{"channel"}        -- the channel from Asterisk
+##    ->{"client_doing"}   -- if defined, the SATC command running
+##    ->{"agi_doing"}      -- if defined, the AGI command type running (or will
+##                            run once vamd_state undef or 3 is attained)
+##    ->{"vamd_state"}     -- undef = not active, 1 = awaiting vamd response,
+##                            2 = awaiting monitor start, 3 = running, -1 =
+##                            awaiting monitor stop
+##    ->{"vamd_q_bytes"}   -- bytes of AGI command to run after vamd_state set
+##    ->{"vamd_q_msg"}     -- AGI client msg in vamd_q_bytes (for logging)
+##    ->{"transfer_q_msg"} -- AGI client transfer to run after SETCALLERID
+##    ->{"playfiles"}[]    -- if defined, the files awaiting play
+##    ->{"playing"}        -- the file currently playing
+##    ->{"recording"}      -- the file currently recording
+##    ->{"stopkeys"}       -- string of keys or vamd signals that stop current
+##                            or previous command (queues vamd events)
+##    ->{"collected"}      -- if def, digits and sigs got, not yet sent to CT
+##    ->{"timeout"}        -- absolute systime timeout, in seconds
+##    ->{"record_max_time"}-- max ms to record
+##    ->{"record_max_silence"} -- max ms of silence before record timeout
+##    ->{"record_started"} -- systime record started in floating-point seconds
+##    ->{"recognize_timeout"} -- max ms to do recognition
+##    ->{"recognize_flag"} -- flag for recognize
+##    ->{"max_dig"}        -- max digits to collect
+##    ->{"grammarname"}    -- if def, the current grammarname loading/unloading
+##    ->{"conference"}     -- if def, the confID this call is going in or in
+##    ->{"confOK"}         -- if def, the conference got successfully joined
+##    ->{"agifh"}          -- if defined, the AGI filehandle controlling
+##    ->{"ctfh"}           -- if defined, the CT client filehandle controlling
+
+$::Fh_to_clientobj = {};
+##  Maps filehandles to client objects:
+##    ->{"type"}           -- one of the FHINFO_TYPE_* below
+##    ->{"fh"}             -- filehandle
+##    ->{"host"}           -- remote host
+##   AGI_CLIENT specific:
+##    ->{"callid"}         -- callid of the corresponding call (if attached)
+##    ->{"uniqueid"}       -- unniqueid of the corresponding call (if attached)
+##    ->{"initok"}         -- defined =>, got the data dump
+##    ->{"astdata"}{<var>} = <value>     -- the initial AGI channel data dump
+##   CT_CLIENT specific:
+##    ->{"protocol"}       -- the protocol object for this connection
+##    ->{"buf"}            -- unparsed bytes received
+##    ->{"allowin"}        -- defined => allow incoming calls
+##    ->{"register"}{<url>} = load  -- pending registrations (pending allowin)
+##    ->{"toself"}{"context"}	-- the info to send calls to self
+##                {"exten"}        for inbound leg of outbound and redirects
+##                {"priority"}
+##    ->{"callid"}{<callid>} -- lists all callids currently managing
+##   ASTMGR specific:
+##    ->{"callmaking"}{<maid>}{"ctfh"}     -- CT filehandle awaiting response
+##                            {"mcid"}     -- mcid awaiting (for MAKECALL)
+##    ->{"awaiting"}{<uniqueid>}	   -- points to above structure
+##    ->{"received"}{<uniqueid>}{"agifh"}  -- says agifh is a new AGI call
+##                                            that may be an out's inbound leg
+##                                            awaiting its uniqueid
+##                              {"when"}   -- epochsecs it's been waiting since
+##    ->{"redirecting"}{<uniqueid>}        -- call awaiting redirect AGIconnect
+##    ->{"dialing"}{<uniqueid>}		   -- callid awaiting dial/xfer result
+
+##  Maps all FHINFO_TYPE_CT_CLIENT filehandle names:
+$::Ct_Client_Fhs = {};
+
+##  Maps: ->{<URL-regex>}{"fh"}{<fh>} = <load>
+$::Registrations = {};
+
+$::Interval_between_log_server_connect_attempts = 60;
+
+use constant FHINFO_TYPE_UNKNOWN => 0;
+use constant FHINFO_TYPE_AGI_LISTENER => 1;
+use constant FHINFO_TYPE_CT_LISTENER => 2;
+use constant FHINFO_TYPE_ASTMANAGER => 3;
+use constant FHINFO_TYPE_VAMD => 4;
+use constant FHINFO_TYPE_AGI_CLIENT => 5;
+use constant FHINFO_TYPE_CT_CLIENT => 6;
+use constant FHINFO_TYPE_DYNLOG => 7;
+use constant FHINFO_TYPE_DEAD => 8;
+
+@::Fhinfo_type_description =
+  (
+   "unknown",
+   "AGI listener",
+   "CT listener",
+   "Asterisk Manager",
+   "VAMD",
+   "AGI client",
+   "CT client",
+   "DynLog",
+   "dead"
+  );
+
+use constant AGI_CLIENT_MSG_ANSWERCALL => 0;
+use constant AGI_CLIENT_MSG_PLAYFILE => 1;
+use constant AGI_CLIENT_MSG_GETDIGIT => 2;
+use constant AGI_CLIENT_MSG_RECORDFILE => 3;
+use constant AGI_CLIENT_MSG_LISTENCALL => 4;
+use constant AGI_CLIENT_MSG_SENDDTMF => 5;
+use constant AGI_CLIENT_MSG_DIAL => 6;
+use constant AGI_CLIENT_MSG_ASRSTART => 7;
+use constant AGI_CLIENT_MSG_ASRSTOP => 8;
+use constant AGI_CLIENT_MSG_LOADGRAMMAR => 9;
+use constant AGI_CLIENT_MSG_UNLOADGRAMMAR => 10;
+use constant AGI_CLIENT_MSG_STARTGRAMMAR => 11;
+use constant AGI_CLIENT_MSG_STOPGRAMMAR => 12;
+use constant AGI_CLIENT_MSG_RECOGNIZE => 13;
+use constant AGI_CLIENT_MSG_TRANSFER => 14;
+use constant AGI_CLIENT_MSG_MONITOR => 15;
+use constant AGI_CLIENT_MSG_STOPMONITOR => 16;
+use constant AGI_CLIENT_MSG_SETVARIABLE => 17;
+use constant AGI_CLIENT_MSG_HANGUP => 18;
+use constant AGI_CLIENT_MSG_SETCALLERID => 19;
+
+@::AGIClientMsgDescription =
+  (
+   "ANSWERCALL",
+   "PLAYFILE",
+   "GETDIGIT",
+   "RECORDFILE",
+   "LISTENCALL",
+   "SENDDTMF",
+   "DIAL",
+   "ASRSTART",
+   "ASRSTOP",
+   "LOADGRAMMAR",
+   "UNLOADGRAMMAR",
+   "STARTGRAMMAR",
+   "STOPGRAMMAR",
+   "RECOGNIZE",
+   "TRANSFER",
+   "MONITOR",
+   "STOPMONITOR",
+   "SETVARIABLE",
+   "HANGUP",
+   "SETCALLERID"
+  );
+
+use constant ASTMGR_MSG_MAKECALL => 0;
+use constant ASTMGR_MSG_STOPCONF => 1;
+use constant ASTMGR_MSG_REDIRECT => 2;
+
+@::AstMgrMsgDescription =
+  (
+   "MAKECALL",
+   "STOPCONF",
+   "REDIRECT",
+  );
+
+###########################################################
+##  Message Data Structures
+
+##  outgoing AGI client messages are represented by a hash:
+##    int msgtype             //  one of the AGI_CLIENT_MSG_*
+##    int callid;             //  for all
+##    String file;            //  for PLAYFILE, RECORDFILE
+##    String stopkeys;        //  for PLAYFILE, RECORDFILE
+##    int timeout;            //  for GETDIGIT, RECORDFILE  in ms, or -1 for no
+##                            //      for RECORDFILE, it's max silence (ms)
+##    int max_time;           //  for RECORDFILE, max record time (ms)
+##    int beep;               //  whether to beep before record
+##    String digits;          //  for PLAYTONE
+
+##  outgoing Asterisk Manager messages are represented by a hash:
+##    int msgtype             //  one of the ASTMGR_MSG_*
+##    String actionid         //  the unique identifier to AstMgr of this msg
+##    String ctfh             //  file handle of CT client making request
+##    String url              //  outside leg URL, called first (for makecall)
+##    String mcid             //  ID of this makecall (for makecall)
+##    int timeout             //  the timeout in ms (for makecall)
+
+
+#################################################################
+##  Start of runtime code (sort of)
+
+##  $string = dump_data ($item)
+##    -- Returns one-line string representation of $item
+sub dump_data
+{
+    my ($item) = shift (@_);
+    my ($obj, $result);
+
+    $obj = new Data::Dumper ([$item], ["item"]);
+    $obj->Indent (0);
+    $obj->Useqq (1);
+    $obj->Terse (1); 
+    $result = $obj->Dump;
+    chomp ($result);
+    return ($result);
+};
+
+$::Last_day = (localtime)[7];
+
+##  Returns the system time in seconds in floating point
+##  with up to microsecond resolution
+sub systime
+{
+    my ($sec, $usec);
+
+    ($sec, $usec) = gettimeofday();
+    return ($sec + $usec / 1000000);
+};
+
+##  &four_byte_to_dot_separated ($four_byte_ip_addr)
+##    Converts 4-byte IP addresses to dot-notation IP addresses
+sub four_byte_to_dot_separated
+{
+    my ($four_byte) = shift (@_);
+    return (join (".", unpack ("C4", $four_byte)));
+};
+
+##  $secs = ms_to_sec ($ms)
+##    -- Returns rounded-up seconds corresponding to millisecond value
+sub ms_to_sec
+{
+    my ($ms) = shift (@_);
+    return (int (ceil ($ms / 1000.0)));
+};
+
+
+##  $stopkeys = translate_stopkeys ($stopkeys)
+##    --  Translates $stopkeys that may contain "+" for all
+##        or "-" for none to the keysequence and vamd signals equivalents
+sub translate_stopkeys
+{
+    my ($stopkeys) = shift (@_);
+    my ($keys) = "";
+    my (@chars) = split (//, $stopkeys);
+    my ($char);
+
+    foreach $char (@chars)
+    {
+	if ($char eq "+")
+	{
+	    $keys .= "0123456789#*";
+	}
+	elsif ($char ne "-")
+	{
+	    $keys .= $char;
+	};
+    };
+    return $keys;
+};
+
+##  openlogfile ($initial)
+##    Opens a new log file, setting ::LOGFH to its handle.
+##    The file name is taken from $::Logfile.
+##    If $initial is true, append an existing file if reasonable.
+##    Rotates existing log files that may already be there.
+sub openlogfile
+{
+    my ($initial) = shift (@_);
+    my ($i, $from, $to, @params);
+
+    if ($::Logfile eq "-")
+    {
+	##  Just use STDOUT
+	open (::LOGFH, ">&STDOUT")
+	  || die ("cannot open ::LOGFH to STDOUT (dup): $!");
+    }
+    else
+    {
+	##  See if the current file is OK (if initial)
+	if ($initial &&
+	    scalar (@params = stat ($::Logfile)) &&
+	    defined ($params[7]) &&
+	    ($params[7] < ($::Max_log_file_size - 1024)))
+	{
+	    ##  Current one is OK
+	    open (::LOGFH, ">>$::Logfile")
+	      || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	    $::Current_log_file_size = $params[7];
+	    select ((select (::LOGFH), $| = 1)[0]);
+	}
+	else
+	{
+	    ##  Rotate
+	    for ($i = $::Number_of_previous_kept - 1; $i >= 0; --$i)
+	    {
+		$from = join (".", $::Logfile, $i);
+		$to = join (".", $::Logfile, $i+1);
+		(-e $from) && rename ($from, $to);
+	    };
+	    (-e $::Logfile)
+	      && rename ($::Logfile, join (".", $::Logfile, "0"));
+	    ##  Open new
+	    open (::LOGFH, ">$::Logfile")
+	      || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	    $::Current_log_file_size = 0;
+	    select ((select (::LOGFH), $| = 1)[0]);
+	};
+    };
+};
+
+sub log_new_day
+{
+    my ($out);
+    my (@dateinfo) = localtime;
+    $::Last_day = $dateinfo[7];
+    $out = join (" ",
+		 "============",
+		 "====",
+		 "LOGSRV",
+		 "LGSRVMAI",
+		 "Today is",
+		 sprintf ("%04d/%02d/%02d",
+			  $dateinfo[5] + 1900,
+			  $dateinfo[4] + 1,
+			  $dateinfo[3]
+			 )) . "\n";
+    (print ::LOGFH ($out))
+      || warn ("Cannot write to log file: $!");
+    $::Current_log_file_size += length ($out);
+};
+
+##  logtofile ($msg_level, $msg)
+##    Logs to the log file the with level $msg_level
+##    message $msg
+sub logtofile
+{
+    my ($msg_level) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($out, $usec, $timestamp, $systime_secs, @dateinfo);
+
+    ($msg_level <= $::Loglevel) || return;
+    ($msg =~ /\n$/) || ($msg .= "\n");
+
+    ##  Check for need to rotate
+    if (($::Logfile ne "-") &&
+	($::Current_log_file_size >= $::Max_log_file_size))
+    {
+	(print ::LOGFH
+	 ("============ ==== LOGSRV LGSRVMAI End log file, rotating log\n"))
+	  || warn ("Cannot write to log file: $!");
+	&openlogfile (0);
+    };
+
+    $usec = systime();
+    $systime_secs = int ($usec);
+    @dateinfo = localtime ($systime_secs);
+    if ($::Last_day != $dateinfo[7])
+    {
+	##  The day just changed
+	log_new_day();
+    };
+    $timestamp = join ("", sprintf ("%02d:%02d:%02d:%03d",
+				    $dateinfo[2],
+				    $dateinfo[1],
+				    $dateinfo[0],
+				    int (($usec - $systime_secs) * 1000)));
+    $out = join (" ",
+		 $timestamp,
+		 (($msg_level < 0) ? "====" :
+		  $::Msg_level_strings[$msg_level]),
+		 $msg);
+    (print ::LOGFH ($out))
+      || warn ("Cannot write to log file: $!");
+    $::Current_log_file_size += length ($out);
+};
+
+##  opendynlog()
+##    Attempts to open a connection to the dynlog server.
+##    On success, it sets $::Time_of_next_connect_to_log_server to 0.
+sub opendynlog
+{
+    my ($ok, $msg);
+
+    $::Time_of_next_connect_to_log_server &&
+      logtofile (LOG_INFO, "connecting to log server on host $::Loghost");
+    ($ok, $msg) = $::Scom->connect ($::Log_fh, $::Loghost, 6410, ".:", 1);
+    if (! $ok)
+    {
+	logtofile (LOG_INFO,
+		   "cannot connect to log server on host $::Loghost: $msg");
+	$::Time_of_next_connect_to_log_server =
+	  time + $::Interval_between_log_server_connect_attempts;
+    }
+    else
+    {
+	$::Time_of_next_connect_to_log_server = 0;
+	$::Fhinfo->{$::Log_fh} = {"type" => FHINFO_TYPE_DYNLOG,
+				  "host" => (gethostbyname ($::Loghost))[4]};
+    };
+};
+
+##  &dynlog ($log_level, $msg);
+##    Submit a logging message $msg at level $log_level
+sub dynlog
+{
+    my ($msg_level) = shift (@_);
+    my ($logmsg) = shift (@_);
+    my ($ok, $msg, $tdstamp, $sec, $usec, @dateinfo, $timestamp);
+
+    $::Time_of_next_connect_to_log_server && return;
+    ($msg_level > $::Loglevel)  && return;
+    if ($msg_level == -1)
+    {
+	##  A status/event message
+    }
+    else
+    {
+	##  A log message
+	$logmsg =~ s/\n/\x01/gs;
+	$logmsg = $msg_level . $::Dynlog_Mymodule ." "
+	  . $::Dynlog_Mythread . "\t" . $logmsg . "\n"
+    };
+    if (! (($ok, $msg) = $::Scom->write ($::Log_fh, $logmsg))[0])
+    {
+	logtofile (LOG_INFO,
+		   "error writing to log server on host $::Loghost: $msg\n");
+	logtofile ($msg_level, $logmsg);
+	$::Scom->unregister ($::Log_fh);
+	$::Time_of_next_connect_to_log_server =
+	  time + $::Interval_between_log_server_connect_attempts;
+    };
+};
+
+##  logit ($msg_level, $msg)
+##    Logs to the current log destination with level $msg_level
+##    message $msg
+sub logit
+{
+    my ($msg_level) = shift (@_);
+    my ($msg) = shift (@_);
+
+    ($msg_level <= $::Loglevel) || return;
+
+    if ((! defined ($::Loghost)) || $::Time_of_next_connect_to_log_server)
+    {
+	logtofile ($msg_level, $msg);
+    }
+    else
+    {
+	dynlog ($msg_level, $msg);
+    };
+};
+
+##  &fail ($msg)
+##    -- This die handler outputs to logit before exit
+sub fail
+{
+    my ($msg) = shift (@_);
+    my ($fh);
+
+    if (defined ($::Loghost) && (! $::Time_of_next_connect_to_log_server))
+    {
+	##  Dynlog is running.  First, kill all non-logging handles.
+	foreach $fh (keys (%$::Fhinfo))
+	{
+	    if ($fh ne $::Log_fh)
+	    {
+		$::Scom->unregister ($fh);
+	    };
+	};
+	##  Next, send the message and wait for it to finish, 10 seconds max
+	dynlog (LOG_CRIT, Carp::longmess ($msg));
+	$::Scom->close_on_flush ($::Log_fh);
+	while (scalar ($::Scom->getevents (10))) {};
+    }
+    else
+    {
+	logtofile (LOG_CRIT, Carp::longmess ($msg));
+    };
+
+    confess ($msg);
+};
+
+##  ($ok, $msg, $maxfds) = &increase_descriptors()
+##    Increases file descriptors to the max, and returns how many in $maxfds
+##    and how many it started out as in $origfds
+sub increase_descriptors
+{
+    my ($rlimit_max, $rlimit_cur, $rlimit_new);
+    my ($resource) = RLIMIT_NOFILE;
+
+    scalar (($rlimit_cur, $rlimit_max) = getrlimit ($resource))
+      || return (0, "getrlimit failed $!");
+    ##  File descriptor limit started at $rlimit_cur
+    $rlimit_new = $rlimit_max;
+    $> || ($rlimit_new = 8192);
+    setrlimit ($resource, $rlimit_new, $rlimit_new)
+      || return (0, "setrlimit failed: $!");
+    ## File descriptor limit set to maximum $rlimit_cur
+    return (1, "", $rlimit_new);
+};
+
+##  &describe_fh ($fh)
+##    Returns text description of client at fh $fh (for logging)
+sub describe_fh
+{
+    my ($fh) = shift (@_);
+    my ($fhinfo, $result, $proto, $callid);
+
+    (defined ($fhinfo = $::Fh_to_clientobj->{$fh}))
+      || return ("unknown fh=\"$fh\"");
+    $result = $::Fhinfo_type_description[$fhinfo->{"type"}] .
+      " on fh=\"$fh\" at host=" . $fhinfo->{"host"};
+    defined ($proto = $fhinfo->{"protocol"})
+      && ($result .=
+	  " proto=" . $proto->protocol_name());
+    defined ($callid = $fhinfo->{"callid"})
+      && (! ref ($callid))
+	&& ($result .= " callid=[" . $fhinfo->{"callid"} . "]");
+    return ($result);
+};
+
+##  agi_client_finished ($fhinfo [, $released])
+##    Called when the AGI call designated by the AGI connection in $fhinfo
+##    is either closed, or returns hangup or -1 (hopefully indicating hangup).
+##    If $released is true, was a release (as opposed to a hangup).
+sub agi_client_finished
+{
+    my ($fhinfo) = shift (@_);
+    my ($released) = shift (@_);
+    my ($callid, $type, $ctfh, $url, $total);
+    my ($fhmap, $uniqueid, $agifh, $callobj, $agiinfo, $searchfh);
+
+    defined ($released) || ($released = 0);
+    if (defined ($callid = $fhinfo->{"callid"}))
+    {
+	##  An active call's AGI has been hungup,
+	##  it may or may not be connected at this point.
+	if (! defined ($callobj = $::Callid_to_callobj->{$callid}))
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			"agi_client_finished() found callid=$callid " .
+			"in agi clientobj has no call object");
+	}
+	else
+	{
+	    ##  Disconnect the AGI filehandle from the call
+	    $::Scom->unregister ($fhinfo->{"fh"});
+	    delete $fhinfo->{"callid"};
+	    delete $fhinfo->{"uniqueid"};
+	    delete $callobj->{"agifh"};
+
+	    ##  If a SATC client exists,
+	    ##  send hangup notification and disconnect it
+	    if (defined ($ctfh = $callobj->{"ctfh"}))
+	    {
+		call_disconnected ($callid, $released);
+	    };
+
+	    ##  This call object is no longer accessible, so delete it too
+	    $uniqueid = $callobj->{"uniqueid"};
+	    delete $::Callid_to_callobj->{$callid};
+	    delete $::Uniqueid_to_callobj->{$uniqueid};
+	};
+    };
+};
+
+##  remove_client ($client_fh [, $released])
+##    Removes client from internal data structures
+##    and handles any consequences of doing so.
+##    (Does not affect system filehandles)
+##    If $released is true, was released as opposed to hangup.
+sub remove_client
+{
+    my ($fh) = shift (@_);
+    my ($released) = shift (@_);
+    my ($fhinfo, $callid, $type, $ctfh, $url, $total);
+    my ($fhmap, $uniqueid, $agifh, $callobj, $agiinfo, $searchfh);
+
+    defined ($released) || ($released = 0);
+    defined ($fhinfo = $::Fh_to_clientobj->{$fh}) || return;
+    $type = $fhinfo->{"type"};
+    if ($type == FHINFO_TYPE_AGI_CLIENT)
+    {
+	agi_client_finished ($fhinfo, $released);
+    }
+    elsif ($type == FHINFO_TYPE_CT_CLIENT)
+    {
+	##  Remove from $::Ct_Client_Fhs map
+	delete $::Ct_Client_Fhs->{$fh};
+
+	##  Delete all calls and their AGI clients that were serving this
+	##  CT client
+	foreach $callid (keys (%{$fhinfo->{"callid"}}))
+	{
+	    ##  This call just lost its controlling CT client
+	    ($::Loglevel >= LOG_NOTI)
+	      && logit (LOG_NOTI,
+			"callid=[" . $callid .
+			"] lost its controlling CT client - " .
+			"terminating call");
+	    defined ($callobj = $::Callid_to_callobj->{$callid}) || next;
+	    ##  Disconnect call from the CT client
+	    delete $fhinfo->{"callid"}{$callid};
+	    delete $callobj->{"ctfh"};
+	    ##  If an AGI filehandle is associated, disconnect and close
+	    ##  and delete the agi clientobj
+	    if (defined ($agifh = $callobj->{"agifh"}) &&
+		defined ($agiinfo = $::Fh_to_clientobj->{$agifh}))
+	    {
+		delete $agiinfo->{"callid"};
+		delete $agiinfo->{"uniqueid"};
+		delete $callobj->{"agifh"};
+		$::Scom->unregister ($agifh);
+		delete $::Fh_to_clientobj->{$agifh};
+	    };
+	    ##  Delete the call object
+	    $uniqueid = $callobj->{"uniqueid"};
+	    delete $::Callid_to_callobj->{$callid};
+	    delete $::Uniqueid_to_callobj->{$uniqueid};
+	};
+
+	##  Remove registrations when CT clients go away
+	foreach $url (keys (%$::Registrations))
+	{
+	    $fhmap = $::Registrations->{$url}{"fh"};
+	    $total = 0;
+	    foreach $searchfh (keys (%$fhmap))
+	    {
+		if ($searchfh eq $fh)
+		{
+		    unregister ($fh, $url);
+		};
+	    };
+	};
+    }
+    elsif ($type == FHINFO_TYPE_VAMD)
+    {
+	$::VAMD_Available = 0;
+    };
+
+    ##  Delete the filehandle object
+    $fhinfo->{"type"} = FHINFO_TYPE_DEAD;
+    delete $::Fh_to_clientobj->{$fh};
+};
+
+##  fh_stopped ($fh, $msg [, $released])
+##    -- Entry point for when any filehandle terminates.
+##       If $msg is length non-0, then it contains the
+##       failure reason for the stoppage.
+##       If $released is true, filehandle was released (as opposed to hangup)
+sub fh_stopped
+{
+    my ($fh) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($released) = shift (@_);
+    my ($fhinfo, $type, $severity, $logmsg);
+    defined ($released) || ($released = 0);
+
+    ##  Determine severity
+    defined ($fhinfo = $::Fh_to_clientobj->{$fh})
+      && ($type = $fhinfo->{"type"});
+    if ((! defined ($type)) ||
+	($type == FHINFO_TYPE_UNKNOWN) ||
+	($type == FHINFO_TYPE_DEAD) ||
+	($type == FHINFO_TYPE_VAMD))
+    {
+	$severity = LOG_EROR;
+    }
+    elsif (($type == FHINFO_TYPE_AGI_LISTENER) ||
+	   ($type == FHINFO_TYPE_CT_LISTENER) ||
+	   ($type == FHINFO_TYPE_ASTMANAGER))
+    {
+	$severity = LOG_EMRG;
+    }
+    else
+    {
+	$severity = LOG_INFO;
+    };
+
+    $logmsg = $::Fhinfo_type_description[$type] .
+      " filehandle \"$fh\" stopped: " . $msg;
+    if ($::Loglevel >= $severity)
+    {
+	logit ($severity, $logmsg);
+    };
+    ($severity == LOG_EMRG) && fail ($logmsg);
+
+    ##  Normal filehandle termination
+    remove_client ($fh, $released);
+};
+
+##  describe_agi_client_msg ($msg)
+##    --  Returns string describing the AGI client message
+##        contained in hash $msg
+sub describe_agi_client_msg
+{
+    my ($msg) = shift (@_);
+    my (@result) = ();
+    my ($type);
+
+    $type = $msg->{"msgtype"};
+    push (@result, $::AGIClientMsgDescription[$type]);
+    if ($type == AGI_CLIENT_MSG_PLAYFILE)
+    {
+	push (@result, " file=\"", $msg->{"file"}, "\"");
+	push (@result, " stopkeys=\"", $msg->{"stopkeys"}, "\"");
+    }
+    elsif ($type == AGI_CLIENT_MSG_GETDIGIT)
+    {
+	push (@result, " timeout=", $msg->{"timeout"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_RECORDFILE)
+    {
+	push (@result, " file=\"", $msg->{"file"}, "\"");
+	push (@result, " stopkeys=\"", $msg->{"stopkeys"}, "\"");
+	push (@result, " timeout=", $msg->{"timeout"});
+	push (@result, " max_time=", $msg->{"max_time"});
+	push (@result, " beep=", $msg->{"beep"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_LISTENCALL)
+    {
+	push (@result, " confid=", $msg->{"confid"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_SENDDTMF)
+    {
+	push (@result, " digits=\"", $msg->{"digits"}, "\"");
+    }
+    elsif ($type == AGI_CLIENT_MSG_DIAL)
+    {
+	push (@result, " to=\"", $msg->{"url"}, "\"");
+	push (@result, " from=\"", $msg->{"from"}, "\"");
+	push (@result, " timeout=", $msg->{"timeout"});
+	push (@result, " bridged=", $msg->{"bridged"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_SETCALLERID)
+    {
+	push (@result, " from=\"", $msg->{"from"}, "\"");
+    }
+    elsif ($type == AGI_CLIENT_MSG_TRANSFER)
+    {
+	push (@result, " to=\"", $msg->{"url"}, "\"");
+	push (@result, " from=\"", $msg->{"from"}, "\"");
+	push (@result, " timeout=", $msg->{"timeout"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_ASRSTART)
+    {
+	push (@result, " url=\"", $msg->{"url"}, "\"");
+    }
+    elsif (($type == AGI_CLIENT_MSG_LOADGRAMMAR) ||
+	   ($type == AGI_CLIENT_MSG_UNLOADGRAMMAR) ||
+	   ($type == AGI_CLIENT_MSG_STARTGRAMMAR) ||
+	   ($type == AGI_CLIENT_MSG_STOPGRAMMAR))
+    {
+	push (@result, " grammarname=\"", $msg->{"grammarname"}, "\"");
+	if ($type == AGI_CLIENT_MSG_LOADGRAMMAR)
+	{
+	    push (@result, " file=\"", $msg->{"file"}, "\"");
+	};
+    }
+    elsif ($type == AGI_CLIENT_MSG_RECOGNIZE)
+    {
+	push (@result, " file=\"", $msg->{"file"}, "\"");
+	push (@result, " timeout=", $msg->{"timeout"});
+	push (@result, " flag=", $msg->{"flag"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_SETVARIABLE)
+    {
+	push (@result, " var=", $msg->{"var"});
+	push (@result, " value=", $msg->{"value"});
+    };
+    return (join ("", @result));
+};
+
+##  describe_astmgr_msg ($msg)
+##    --  Returns string describing the Asterisk Manager message
+##        contained in hash $msg
+sub describe_astmgr_msg
+{
+    my ($msg) = shift (@_);
+    my (@result) = ();
+    my ($type);
+
+    $type = $msg->{"msgtype"};
+    push (@result, $::AstMgrMsgDescription[$type]);
+    if ($type == ASTMGR_MSG_MAKECALL)
+    {
+	push (@result, " actionid=\"", $msg->{"actionid"}, "\"");
+	push (@result, " ctfh=\"", $msg->{"ctfh"}, "\"");
+	push (@result, " url=\"", $msg->{"url"}, "\"");
+	push (@result, " from=\"", $msg->{"from"}, "\"");
+	push (@result, " mcid=\"", $msg->{"mcid"}, "\"");
+	push (@result, " timeout=\"", $msg->{"timeout"}, "\"");
+	push (@result, " context=\"", $msg->{"context"}, "\"");
+	push (@result, " exten=\"", $msg->{"exten"}, "\"");
+	push (@result, " priority=\"", $msg->{"priority"}, "\"");
+    }
+    elsif ($type == ASTMGR_MSG_STOPCONF)
+    {
+	push (@result, " confid=\"", $msg->{"confid"}, "\"");
+    }
+    elsif ($type == ASTMGR_MSG_REDIRECT)
+    {
+	push (@result, " callid=\"", $msg->{"callid"}, "\"");
+	push (@result, " channel=\"", $msg->{"channel"}, "\"");
+	push (@result, " context=\"", $msg->{"context"}, "\"");
+	push (@result, " exten=\"", $msg->{"exten"}, "\"");
+	push (@result, " priority=\"", $msg->{"priority"}, "\"");
+    };
+    return (join ("", @result));
+};
+
+$::Valid_record_extensions = { "ulaw" => 1, "alaw" => 1 };
+##  ($ok, $msg, $base, $extension) = split_record_filepath ($filepath);
+##    -- Splits $filepath into $base, the basename, and $extension,
+##       the extension.  Verifies that $extension is valid.
+sub split_record_filepath
+{
+    my ($filepath) = shift (@_);
+    my ($base, $extension);
+    if ($filepath =~ /^(.+)\.([^\.\/]+)$/)
+    {
+	$base = $1;
+	$extension = $2;
+	if (defined ($::Valid_record_extensions->{$extension}))
+	{
+	    return (1, "", $base, $extension);
+	};
+	return (0, "unsupported record audio format extension $extension");
+    }
+    else
+    {
+	return (0, "record filename must have an extension");
+    };
+};
+
+##  ($keys, $signals) = separate_keys_and_signals ($stopkeys)
+##    -- Separates out DTMF $keys from vamd $signals
+sub separate_keys_and_signals
+{
+    my ($stopkeys) = shift (@_);
+    my (@chars) = split (//, $stopkeys);
+    my ($keys) = "";
+    my ($signals) = "";
+    my ($char);
+
+    foreach $char (split (//, $stopkeys))
+    {
+	if ($char =~ /[hmt]/)
+	{
+	    $signals .= $char;
+	}
+	else
+	{
+	    $keys .= $char;
+	};
+    };
+    return ($keys, $signals);
+}
+
+##  ($ok, $msg, $result, $comment, $values) = parse_agi_result ($agi_result)
+##    Given an asterisk agi result in $agi_result, returns
+##    $ok of 1 if the result is in proper format, -1 if a hangup, 0 o.w.
+##    $msg is a potentially human-readable error message if $ok == 0.
+##    $result is a (possibly undef) "result=" number returned by the function.
+##    $comment is a (possibly undef) comment (sent in parens after result=).
+##    $values is a (possibly undef) hash of additional values returned to us
+sub parse_agi_result
+{
+    my ($agi_result) = shift (@_);
+    my ($result, $values, $field, $value, $comment);
+
+    if ($agi_result =~ /^200\s*/)
+    {
+	##  A success response
+	$agi_result =~ s/^200\s*//;
+
+	##  Get the result
+	if ($agi_result =~ /^result=(-?\d+)\s*/)
+	{
+	    $result = $1;
+	    $agi_result =~ s/^result=(-?\d+)\s*//;
+
+	    ##  Sometimes a description in parens follows
+	    if ($agi_result =~ /^\(([^\)]*)\)\s*/)
+	    {
+		$comment = $1;
+		$agi_result =~ s/^\(([^\)]*)\)\s*//;
+	    };
+
+	    ##  Get any additional values
+	    while ($agi_result =~ /^([^=]+)=(\S+)\s*/)
+	    {
+		$field = $1;
+		$value = $2;
+		$values->{$field} = $value;
+		$agi_result =~ s/^([^=]+)=(\S+)\s*//;
+	    };
+	};
+
+	##  See if anything was left over
+	if (length ($agi_result))
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			"Unparseable portion of AGI response: " .
+			dump_data ($agi_result));
+	};
+
+	return (1, "", $result, $comment, $values);
+    }
+    elsif ($agi_result =~ /^hangup/i)
+    {
+	##  A hangup response
+	return (-1, $agi_result);
+    }
+    elsif ($agi_result =~ /^(\d+)\s+(.*)$/)
+    {
+	##  An error response
+	return (0, $1 . " " . $2);
+    }
+    else
+    {
+	return (0, "Cannot parse AGI result: $agi_result");
+    };
+};
+
+##  ($ok, $msg, $values) = parse_astmgr_msg ($data)
+##    Given an Asterisk Manager message in $data, returns
+##    $ok of 1 if the result is in proper format, 0 o.w.
+##    $msg is a potentially human-readable error message if $ok == 0.
+##    $values is a (possibly undef) hash of name/value pairs returned to us
+sub parse_astmgr_msg
+{
+    my ($data) = shift (@_);
+    my ($values, $field, $value, $line, @lines);
+    my ($ok) = 1;
+
+    ##  Split it into lines
+    @lines = split (/\r\n/, $data);
+    ##  Put each line into name/value pair
+    $value = {};
+    while (defined ($line = shift (@lines)))
+    {
+	if ($line =~ /^([^:]+):\s*(.*)$/)
+	{
+	    $field = $1;
+	    $value = $2;
+	    $values->{$field} = $value;
+	}
+	else
+	{
+	    ($::Loglevel >= LOG_WARN)
+	      && logit (LOG_WARN, "Unparseable line from astmgr: " .
+			dump_data ($line));
+	    $ok = 0;
+	};
+    }
+
+    $ok || return (0, "Unparseable lines", $values);
+    return (1, "", $values);
+};
+
+##  $ct_server_msg =
+##      generic_ct_server_error_response ($msgtype, $errmsg, $callid)
+##    -- Given a SATC server message type $msgtype, returns a hash
+##       representing a generic server error of that type including
+##       the given $msg as the error message.  If $callid is supplied,
+##       it is included as the "callid" field.
+sub generic_ct_server_error_response
+{
+    my ($msgtype) = shift (@_);
+    my ($errmsg) = shift (@_);
+    my ($callid) = shift (@_);
+    my ($format, $field_name, $msg);
+
+    $msg = {Satc::MSGTYPE => $msgtype,
+	    Satc::STATUS => Satc::RESPONSE_FAIL,
+	    Satc::MSG => $errmsg};
+    if (($msgtype == Satc::HUNGUP) ||
+	($msgtype == Satc::ANSWERED) ||
+	($msgtype == Satc::MADECALL) ||
+	($msgtype == Satc::PLAYED) ||
+	($msgtype == Satc::RECORDED) ||
+	($msgtype == Satc::DIGCLEARED) ||
+	($msgtype == Satc::GOTDIG) ||
+	($msgtype == Satc::PLAYEDDIG) ||
+	($msgtype == Satc::JOINEDCONF) ||
+	($msgtype == Satc::EXITEDCONF) ||
+	($msgtype == Satc::BRIDGED) ||
+	($msgtype == Satc::UNBRIDGED) ||
+	($msgtype == Satc::TRANSFERED))
+    {
+	$msg->{Satc::CALLID} = (defined ($callid) ? $callid : 0);
+    };
+    if (($msgtype == Satc::PLAYED) ||
+	($msgtype == Satc::RECORDED) ||
+	($msgtype == Satc::GOTDIG))
+    {
+	$msg->{Satc::REASON} = 0;
+    };
+    if ($msgtype == Satc::GOTDIG)
+    {
+	$msg->{Satc::DIGITS} = "";
+    };
+    return ($msg);
+};
+
+##  ($found, $len) = findmatch ($collected, $stopkeys, $maxdigits, $timedout);
+##    -- Looks for the first match of:
+##         1st: any of the characters in $stopkeys is in $collected
+##         1st: $maxdigits characters exist in $collected
+##         3rd: systime is >= timeout time.
+##       If $collected is undef or no length, ignores $stopkeys & $maxdigits.
+##       If $stopkeys is undef or length = 0, ingores that condition.
+##       If $maxdigits is undef or 0, ignores that condition.
+##       If $timedout is true, got a timeout on the digit collection.
+##       Returned result $found is one of the Satc::GOTDIGIT_REASON_* :
+##           0 - no match found
+##           1 - found a $stopkeys character in $collected
+##           2 - $collected has achieved $maxdigits
+##           3 - timeout has occurred, so $len is all of $collected
+##       If $found is not 0, $len is the length of the initial portion
+##       of $collected that is the match.
+sub findmatch
+{
+    my ($collected) = shift (@_);
+    my ($stopkeys) = shift (@_);
+    my ($maxdigits) = shift (@_);
+    my ($timedout) = shift (@_);
+    my ($lenmatch, $keysmatch, $timeoutmatch);
+
+    if (defined ($collected) && length ($collected))
+    {
+	if (defined ($maxdigits) && ($maxdigits != 0)
+	    && (length ($collected) >= $maxdigits))
+	{
+	    $lenmatch = $maxdigits;
+	};
+	if (defined ($stopkeys) && length ($stopkeys) &&
+	    ($collected =~ /(^[^$stopkeys]*?[$stopkeys])/))
+	{
+	    $keysmatch = $1;
+	};
+    };
+    if ((! defined ($lenmatch)) && (! defined ($keysmatch)))
+    {
+	##  Only chance of a match is via timeout
+	if ($timedout)
+	{
+	    return (Satc::GOTDIGIT_REASON_TIMEOUT,
+		    defined ($collected) ? length ($collected) : 0);
+	};
+	##  No match
+	return (0, 0);
+    };
+    defined ($lenmatch) && (! defined ($keysmatch))
+      && return (Satc::GOTDIGIT_REASON_MAX_DIGITS, $lenmatch);
+    (! defined ($lenmatch)) && defined ($keysmatch)
+      && return (Satc::GOTDIGIT_REASON_TERM_PRESSED, length ($keysmatch));
+    ##  Both $lenmatch and $keysmatch are defined
+    (length ($keysmatch) <= $lenmatch)
+      && return (Satc::GOTDIGIT_REASON_TERM_PRESSED, length ($keysmatch));
+    return (Satc::GOTDIGIT_REASON_MAX_DIGITS, $lenmatch);
+};
+
+##  send_bytes ($fh, $bytes)
+##    -- Sends $bytes to filehandle represented by $fh
+sub send_bytes
+{
+    my ($fh) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ok, $msg, $fhinfo);
+
+    if (! defined ($fhinfo = $::Fh_to_clientobj->{$fh}))
+    {
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG, "Cannot send " .
+		    dump_data ($bytes) .
+		    " to "  . $fh .
+		    " : no clientobj found, assuming terminated");
+	return;
+    };
+    if ($fhinfo->{"type"} == FHINFO_TYPE_DEAD)
+    {
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG, "Not sending " .
+		    dump_data ($bytes) .
+		    " to "  . describe_fh ($fhinfo->{"fh"}));
+	return;
+    };
+
+    ($::Loglevel >= LOG_DBUG)
+      && ($fhinfo->{"type"} ne FHINFO_TYPE_DYNLOG)
+	&& logit (LOG_DBUG, "snd " .
+		  dump_data ($bytes) .
+		  " to "  . $fhinfo->{"fh"});
+
+    ($ok, $msg) = $::Scom->write ($fh, $bytes);
+    if (! $ok)
+    {
+	fh_stopped ($fh, $msg);
+    };
+};
+
+##  send_ct_server_msg ($ctinfo, $ct_server_msg)
+##    -- Sends $ct_server_msg to SATC client $ctinfo
+sub send_ct_server_msg
+{
+    my ($ctinfo) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($format_string, $fmt, $type, $msgsize, $bytes, $callid);
+    my ($format, $field, $field_name, $conversion, $ctfh);
+    my ($ok, $errmsg, $agifh, $agiinfo, $protocol, $callobj);
+    my (@tosend) = ();
+
+    ##  Convert it to serialized form
+    $type = $msg->{Satc::MSGTYPE};
+    $protocol = $ctinfo->{"protocol"};
+    ($ok, $errmsg, $bytes) = $protocol->encode ($msg);
+    if (! $ok)
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR,
+		    "$errmsg for SATC server msg " .
+		    $protocol->describe_msg ($msg) .
+		    " cannot send to "  . describe_fh ($ctinfo->{"fh"}));
+	return;
+    };
+
+    ##  Send it off
+    $callid = $msg->{Satc::CALLID};
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, (defined ($callid) ?
+			   ("callid=[" . $callid . "] ") : "")
+		. "snd " . $protocol->describe_msg ($msg) .
+		" to "  . describe_fh ($ctinfo->{"fh"}));
+
+    send_bytes ($ctinfo->{"fh"}, $bytes);
+
+    ##  If this was a channel-specific message, then
+    ##  we must be done with whatever that channel was last doing
+    if (defined ($callid) &&
+	defined ($callobj = $::Callid_to_callobj->{$callid}))
+    {
+	delete $callobj->{"client_doing"};
+    };
+};
+
+##  send_vamd_msg ($callid, $message)
+##    -- Sends $message (without terminating newline) to VAMD.
+sub send_vamd_msg
+{
+    my ($callid) = shift (@_);
+    my ($message) = shift (@_);
+
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, (defined ($callid) ?
+			   ("callid=[" . $callid . "] ") : "") .
+		"snd " . $message .
+		" to "  . describe_fh ($::VAMDFh));
+    send_bytes ($::VAMDFh, $message . "\n");
+}
+
+##  send_agi_client_msg ($callobj, $agi_client_msg)
+##    -- Sends $agi_client_msg for $callobj to its AGI filehandle
+sub send_agi_client_msg
+{
+    my ($callobj) = shift (@_);
+    my ($agimsg) = shift (@_);
+    my ($callid, $bytes, $type, $stopkeys, $signals, $timeout, $agifh);
+    my ($filename, $play_flags, $offset, $ok, $msg, $base, $exten);
+    my ($vamd_state);
+
+    $callid = $callobj->{"callid"};
+    if (! (defined ($agifh = $callobj->{"agifh"})))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "[" . $callobj->{"callid"} . "] " .
+		    "Cannot send msg " .
+		    describe_agi_client_msg ($agimsg) .
+		    " AGI filehandle is detached");
+	return;
+    };
+    $type = $agimsg->{"msgtype"};
+    if ($type == AGI_CLIENT_MSG_ANSWERCALL)
+    {
+	$bytes = "ANSWER\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_PLAYFILE)
+    {
+	($stopkeys, $signals) =
+	  separate_keys_and_signals ($agimsg->{"stopkeys"});
+	$filename = $agimsg->{"file"};
+
+	##  Extract playfile flags, currently only start=XXX
+	if ($filename =~ /^([^\^]+)\^(.*)$/)
+	{
+	    $filename = $1;
+	    $play_flags = $2;
+	    if ($play_flags =~ /^start=(\d+)$/)
+	    {
+		$offset = $1;
+		$offset *= 8;   ##  8 samples per ms at 8KHz
+	    };
+	};
+
+	##  Asterisk AGI can't handle audio file extensions, so
+	##  delete them if they are present
+	$filename =~ s/\.($::AstSoundFileExtenRegex)$//;
+
+	$bytes = join (" ",
+		       "STREAM FILE",
+		       $filename,
+		       (length ($stopkeys) ? $stopkeys : "\"\""),
+		       (defined ($offset) ? $offset : ()))
+	  . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_GETDIGIT)
+    {
+	($stopkeys, $signals) =
+	  separate_keys_and_signals ($callobj->{"stopkeys"});
+	$timeout = $agimsg->{"timeout"};
+	if (($timeout == 0) || ($timeout == -1))
+	{
+	    $timeout = -1;
+	};
+	$bytes = join (" ",
+		       "WAIT FOR DIGIT",
+		       $timeout)
+	  . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_RECORDFILE)
+    {
+	($stopkeys, $signals) =
+	  separate_keys_and_signals ($agimsg->{"stopkeys"});
+	($ok, $msg, $base, $exten) =
+	  split_record_filepath ($agimsg->{"file"});
+	$bytes = join (" ",
+		       "RECORD FILE",
+		       $base,
+		       $exten,
+		       "\"" . $stopkeys . "\"",
+		       $agimsg->{"max_time"},
+		       ($agimsg->{"beep"} ? "BEEP" : ""),
+		       "s=" . ms_to_sec ($agimsg->{"timeout"}),
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_LISTENCALL)
+    {
+	$bytes = join (" ",
+		       "EXEC",
+		       "MeetMe",
+		       "\"" . join ("|",
+				    $agimsg->{"confid"},
+				    "dpqx",
+				   ) . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_SENDDTMF)
+    {
+	$bytes = join (" ",
+		       "EXEC",
+		       "SendDTMF",
+		       "\"" . join ("|",
+				    $agimsg->{"digits"},
+				   ) . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_SETCALLERID)
+    {
+	$bytes = join (" ",
+		       "EXEC",
+		       "Set",
+		       "CALLERID(all)=" . $agimsg->{"from"});
+    }
+    elsif ($type == AGI_CLIENT_MSG_DIAL)
+    {
+	$timeout = $agimsg->{"timeout"};
+	if ($timeout == 0)
+	{
+	    $timeout = ""
+	}
+	else
+	{
+	    $timeout = int ($timeout / 1000);
+	}
+	$bytes = join (" ",
+		       "EXEC",
+		       "Dial",
+		       "\"" . join ("|",
+				    $agimsg->{"url"},
+				    $timeout,
+				    $agimsg->{"bridged"} ? "go" : "o",
+				   ) . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_TRANSFER)
+    {
+	$bytes = join (" ",
+		       "EXEC",
+		       "Transfer",
+		       $agimsg->{"url"},
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_ASRSTART)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "CREATE",
+		       "\"" . $agimsg->{"url"} . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_ASRSTOP)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "DESTROY",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_LOADGRAMMAR)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "LOAD",
+		       "GRAMMAR",
+		       "\"" . $agimsg->{"grammarname"} . "\"",
+		       "\"" . $agimsg->{"file"} . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_UNLOADGRAMMAR)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "UNLOAD",
+		       "GRAMMAR",
+		       "\"" . $agimsg->{"grammarname"} . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_STARTGRAMMAR)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "ACTIVATE",
+		       "GRAMMAR",
+		       "\"" . $agimsg->{"grammarname"} . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_STOPGRAMMAR)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "DEACTIVATE",
+		       "GRAMMAR",
+		       "\"" . $agimsg->{"grammarname"} . "\"",
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_RECOGNIZE)
+    {
+	$bytes = join (" ",
+		       "SPEECH",
+		       "RECOGNIZE",
+		       "\"" . $agimsg->{"file"} . "\"",
+		       $agimsg->{"timeout"},
+		       $agimsg->{"flag"} == 0 ? "speech" : "dtmf"
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_SETVARIABLE)
+    {
+	$bytes = join (" ",
+		       "SET",
+		       "VARIABLE",
+		       $agimsg->{"var"},
+		       (length ($agimsg->{"value"}) ?
+			$agimsg->{"value"} : "\"\"")
+		      ) . "\n";
+    }
+    elsif ($type == AGI_CLIENT_MSG_HANGUP)
+    {
+	$bytes = "HANGUP" . "\n";
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Undefined AGI client msg " .
+		    describe_agi_client_msg ($agimsg) .
+		    " cannot send to "  . describe_fh ($agifh));
+	return;
+    };
+
+    ##  At this point:
+    ##    $agimsg = the agi message structure to send
+    ##    $bytes = the actual bytes the implement the $agimsg structure
+    ##    $signals = if defined, vamd signal chars active
+
+    ##  Record the fact that we are executing this command
+    ##  (or will be once vamd_state gets set)
+    $callobj->{"agi_doing"} = $type;
+
+    ##  See if need to replace and queue desired command by preceding it with
+    ##  starting a vamd request or terminating a monitor.
+    $vamd_state = $callobj->{"vamd_state"};
+    if (defined ($signals) && length ($signals) && (! defined ($vamd_state)))
+    {
+	##  Have to turn on vamd signals
+	if (! $::VAMD_Available)
+	{
+	    logit (LOG_EROR, "[" . $callid . "] " .
+		   "Signals requested, but VAMD not available");
+	}
+	else
+	{
+	    ##  Send vamd the request
+	    send_vamd_msg ($callid, "listen $callid.ul");
+	    if ($::VAMD_Available)
+	    {
+		##  Queue the eventual command
+		$callobj->{"vamd_q_bytes"} = $bytes;
+		$callobj->{"vamd_q_msg"} = $agimsg;
+
+		$callobj->{"vamd_state"} = 1;
+		return;
+	    };
+	};
+    }
+    elsif (((! defined ($signals)) || (! length ($signals)))
+	   && defined ($vamd_state))
+    {
+	##  Have to turn off monitor for vamd
+
+	##  Queue the eventual command
+	$callobj->{"vamd_q_bytes"} = $bytes;
+	$callobj->{"vamd_q_msg"} = $agimsg;
+
+	##  Replace with StopMonitor command
+	$agimsg = {
+		   "msgtype" => AGI_CLIENT_MSG_STOPMONITOR,
+		   "callid" => $callid,
+		  };
+	$bytes = "EXEC StopMixMonitor\n";
+	$callobj->{"vamd_state"} = -1;
+    }
+
+    ##  Send it off
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, ("callid=[" . $callid . "] snd " .
+			   describe_agi_client_msg ($agimsg) .
+			   " to "  . describe_fh ($agifh)));
+    send_bytes ($agifh, $bytes);
+};
+
+##  send_astmgr_msg ($astmancmd)
+##    -- Sends $astmancmd message to the Asterisk Manager
+sub send_astmgr_msg
+{
+    my ($astmgrmsg) = shift (@_);
+    my ($bytes, $type, $url, $pos);
+
+    $type = $astmgrmsg->{"msgtype"};
+    if ($type == ASTMGR_MSG_MAKECALL)
+    {
+	$url = $astmgrmsg->{"url"};
+	if ($url =~ /^[a-zA-Z]+:/)
+	{
+	    ##  Change things like "sip:" to "sip/"
+	    $pos = index ($url, ":");
+	    substr ($url, $pos, 1, "/");
+	};
+	$bytes = join ("\r\n",
+		       "Action: Originate",
+		       ##  Outside leg, done 1st
+		       "Channel: " . $url,
+		       ##  Inside leg, done 2nd
+		       "Context: " . $astmgrmsg->{"context"},
+		       "Exten: " . $astmgrmsg->{"exten"},
+		       "Priority: " . $astmgrmsg->{"priority"},
+		       "Callerid: " . $astmgrmsg->{"from"},
+		       "Timeout: " . $astmgrmsg->{"timeout"},
+		       "Async: 1",
+		       "ActionID: " . $astmgrmsg->{"actionid"},
+		       "", "");   ##  Need trailing double \r\n
+    }
+    elsif ($type == ASTMGR_MSG_STOPCONF)
+    {
+	##  Send CLI command "MeetMe kick <confid> all"
+	$bytes = join ("\r\n",
+		       "Action: Command",
+		       "Command: MeetMe kick "
+		       . $astmgrmsg->{"confid"} . " all",
+		       "", "");   ##  Need trailing double \r\n
+    }
+    elsif ($type == ASTMGR_MSG_REDIRECT)
+    {
+	##  Send command Redirect
+	##  No point in an ActionID, since it returns success even
+	##  when there is failure
+	$bytes = join ("\r\n",
+		       "Action: Redirect",
+		       "Channel: " . $astmgrmsg->{"channel"},
+		       "Context: " . $astmgrmsg->{"context"},
+		       "Exten: " . $astmgrmsg->{"exten"},
+		       "Priority: " . $astmgrmsg->{"priority"},
+		       "", "");   ##  Need trailing double \r\n
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Undefined ASTMGR msg " .
+		    describe_astmgr_msg ($astmgrmsg) .
+		    " cannot send to AstMgr");
+	return;
+    };
+
+    ##  Send it off
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, ("snd " .
+			   describe_astmgr_msg ($astmgrmsg) .
+			   " to AstMgr"));
+    send_bytes ($::AstMgrFh, $bytes);
+};
+
+##  register ($fh, $url, $load)
+##    -- puts registration info in $::Registrations for CT client
+##       at filehandle $fh
+sub register
+{
+    my ($fh) = shift (@_);
+    my ($url) = shift (@_);
+    my ($load) = shift (@_);
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "Registered \"" . $url . "\" to " .
+	       describe_fh ($fh));
+    };
+
+    $::Registrations->{$url}{"fh"}{$fh} = $load;
+};
+
+##  unregister ($fh, $url)
+##    -- removes registration info from $::Registrations for CT client
+##       at filehandle $fh
+sub unregister
+{
+    my ($fh) = shift (@_);
+    my ($url) = shift (@_);
+    my ($fhmap);
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "Unregistered \"" . $url . "\" for " .
+	       describe_fh ($fh));
+    };
+
+    (defined ($::Registrations->{$url})) || return;
+    $fhmap = $::Registrations->{$url}{"fh"};
+    delete $fhmap->{$fh};
+    if (! scalar (keys (%$fhmap)))
+    {
+	delete $::Registrations->{$url};
+    };
+};
+
+##  ($ok, $msg, $callobj) =
+##      check_todo_telephony ($ctinfo, $callid, $type, $response_type)
+##    -- Checks if $ctinfo's attempt to do CT client msg $type on call
+##       $callid is valid.  If it is valid, returns $ok = true and $callobj
+##       the call object representing $callid.  Otherwise, $ok = false,
+##       and an error repsponse will be sent to the $ctinfo filehandle
+##       with a msgtype of $response_type.
+sub check_todo_telephony
+{
+    my ($ctinfo) = shift (@_);
+    my ($callid) = shift (@_);
+    my ($type) = shift (@_);
+    my ($response_type) = shift (@_);
+    my ($callobj, $msg, $client_doing);
+
+    if (! defined ($callobj = $::Callid_to_callobj->{$callid}))
+    {
+	$msg = "Call $callid has no definition";
+    }
+    elsif (($type != Satc::STOPMEDIA) &&
+	   ($type != Satc::RELEASE) &&
+	   defined ($callobj->{"client_doing"}))
+    {
+	$msg = "Call $callid already doing " .
+	  $::CT_Protocols[0]->describe_msgtype ($callobj->{"client_doing"});
+    }
+    elsif (($type == Satc::STOPMEDIA) &&
+	   (! defined ($client_doing = $callobj->{"client_doing"})))
+    {
+	##  Ignore STOPPLAY if no SATC client operation is ongoing
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG,
+		    ("[" . $callid . "] " .
+		     "STOPPLAY ingored because nothing to stop"));
+	return (0, "STOPPLAY ingored because nothing to stop");
+    }
+    elsif (($type == Satc::STOPMEDIA) &&
+	   ($client_doing != Satc::PLAY) &&
+	   ($client_doing != Satc::RECORD) &&
+	   ($client_doing != Satc::GETDIG) &&
+	   ($client_doing != Satc::PLAYDIG))
+    {
+	##  STOPPLAY only allowed for certain commands
+	$msg = "Cannot STOPPLAY a " .
+	  $::CT_Protocols[0]->describe_msgtype ($client_doing);
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG,
+		    ("[" . $callid . "] " . $msg));
+	return (0, $msg);
+    }
+    ##  Check for being in a conference and trying to do media operations
+    ##  (GETDIGIT is permitted, as it will get queued for when conference ends)
+    elsif ((($type == Satc::PLAY) ||
+	    ($type == Satc::RECORD) ||
+	    ($type == Satc::BRIDGE) ||
+	    ($type == Satc::TRANSFER) ||
+	    ($type == Satc::PLAYDIG))
+	   && defined ($callobj->{"conference"}))
+    {
+	$msg = "Call $callid in a conference - media not permitted";
+    };
+
+    if (defined ($msg))
+    {
+	##  Failure
+	send_ct_server_msg
+	  ($ctinfo,
+	   generic_ct_server_error_response
+	   ($response_type, $msg, $callid));
+	return (0, $msg);
+    }
+    else
+    {
+	##  Success
+	return (1, "", $callobj);
+    };
+};
+
+##  ($ok, $msg, $ctinfo) =
+##      check_result_telephony
+##         ($callobj, $ct_expected_doing, $ct_response_type, $err);
+##    -- Checks if $callobj's result from an AGI command
+##       is valid including matching call's "client_doing" field
+##       against $ct_expected_doing.
+##       If it is valid, returns $ok = true and $ctinfo is
+##       the SATC client filehandle clientobj.  Otherwise, $ok = false.
+##       and an error will be logged and sent to the CT client if possible.
+##       If $err is defined, it is taken as an error message that has already
+##       occurred, and will send the error to the CT client if possible.
+##       $ct_response_type will be used to send the error to any CT client.
+sub check_result_telephony
+{
+    my ($callobj) = shift (@_);
+    my ($ct_expected_doing) = shift (@_);
+    my ($ct_response_type) = shift (@_);
+    my ($errmsg) = shift (@_);
+    my ($ctfh, $ctinfo, $callid, $agi_doing, $ct_doing, $ct_response);
+
+    $callid = $callobj->{"callid"};
+
+    ##  See if SATC client was disconnected from call
+    if (! defined ($ctfh = $callobj->{"ctfh"}))
+    {
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG,
+		    ("[" . $callid . "] " .
+		     "Ignoring AGI response to " .
+		     $::CT_Protocols[0]->describe_msgtype
+		     ($ct_expected_doing) .
+		     " because call was disconnected from " .
+		     " the CT client filehandle"));
+	return (0, "disconnected");
+    };
+
+    if (! defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR,
+		    ("[" . $callid . "] " .
+		     "check_result_telephony() ignoring AGI response to " .
+		     $::CT_Protocols[0]->describe_msgtype
+		     ($ct_expected_doing) .
+		     " because CT client filehandle \"" .
+		     $ctfh . "\" has no clientobj definition"));
+	return (0, "disconnected");
+    };
+
+    if (! defined ($errmsg))
+    {
+	$agi_doing = $callobj->{"agi_doing"};
+	delete $callobj->{"agi_doing"};
+
+	$ct_doing = $callobj->{"client_doing"};
+	if ($ct_doing != $ct_expected_doing)
+	{
+	    $errmsg = "callid=[" . $callid .
+	      "] CT client doing " .
+		$::CT_Protocols[0]->describe_msgtype ($ct_doing) .
+		  " but should be doing " .
+		    $::CT_Protocols[0]->describe_msgtype ($ct_expected_doing) .
+		      " after receiving AGI " .
+			$::AGIClientMsgDescription[$agi_doing];
+	};
+    };
+
+    if (defined ($errmsg))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, $errmsg);
+	$ct_response = {Satc::MSGTYPE => $ct_response_type,
+			Satc::CALLID => $callid,
+			Satc::STATUS => Satc::RESPONSE_FAIL,
+			Satc::MSG => $errmsg};
+	if ($ct_response_type == Satc::PLAYED)
+	{
+	    $ct_response->{Satc::REASON} =
+	      Satc::PLAYEDFILE_REASON_UNDETERMINED;
+	}
+	elsif ($ct_response_type == Satc::RECORDED)
+	{
+	    $ct_response->{Satc::REASON} =
+	      Satc::RECORDED_REASON_UNDETERMINED;
+	}
+	elsif ($ct_response_type == Satc::GOTDIG)
+	{
+	    $ct_response->{Satc::REASON} =
+	      Satc::GOTDIGIT_REASON_UNDETERMINED;
+	    $ct_response->{Satc::DIGITS} = "";
+	};
+	defined ($ctinfo)
+	  && send_ct_server_msg
+	    ($ctinfo, $ct_response);
+	return (0, $errmsg);
+    }
+    else
+    {
+	##  Success
+	return (1, "", $ctinfo);
+    };
+};
+
+##  play_next_file ($callobj)
+##    -- Starts the next file play for call $callobj
+sub play_next_file
+{
+    my ($callobj) = shift (@_);
+    my ($filelist, $nextfile, $stopkeys, $ctfh, $ctinfo);
+    my ($gotstopkey) = 0;
+    my ($eof) = 0;
+
+    ##  First, see if a key has been pressed to terminate the playfile/recognize
+    ##  Or if we are out of playfiles
+    ($gotstopkey, $_) = findmatch ($callobj->{"collected"},
+				   $callobj->{"stopkeys"});
+    if (! $gotstopkey)
+    {
+	$eof = ((! defined ($filelist = $callobj->{"playfiles"}))
+		|| (! defined ($nextfile = shift (@$filelist))));
+    };
+    if ($gotstopkey || $eof)
+    {
+	##  Done playing this set of files
+	delete $callobj->{"playfiles"};
+	if ((! defined ($ctfh = $callobj->{"ctfh"})) ||
+	    (! defined ($ctinfo = $::Fh_to_clientobj->{$ctfh})))
+	{
+	    ($::Loglevel >= LOG_CRIT)
+	      && logit (LOG_CRIT,
+			"callid=[" . $callobj->{"callid"} .
+			"] no CT client found for " .
+			$callobj->{"client_doing"} . " response");
+	    return;
+	};
+	if ($callobj->{"client_doing"} == Satc::PLAY)
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::PLAYED,
+			 Satc::CALLID => $callobj->{"callid"},
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => "",
+			 Satc::REASON =>
+			 ($gotstopkey
+			  ? Satc::PLAYEDFILE_REASON_DTMF_PRESSED
+			  : Satc::PLAYEDFILE_REASON_END_OF_DATA)});
+	}
+	else  ##  Satc::RECOGNIXE
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::RECOGNIZED,
+			 Satc::CALLID => $callobj->{"callid"},
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => "",
+			 Satc::REASON =>
+			 ($gotstopkey
+			  ? Satc::RECOGNIZED_REASON_DTMF_PRESSED
+			  : Satc::RECOGNIZED_REASON_NO_AUDIO_TIMEOUT)});
+	};
+	return;
+    };
+
+    ##  Need to start another playfile/recognize
+    scalar (@$filelist) || (delete $callobj->{"playfiles"});
+    $callobj->{"playing"} = $nextfile;
+    if ($callobj->{"client_doing"} == Satc::PLAY)
+    {
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_PLAYFILE,
+		      "file" => $nextfile,
+		      "stopkeys" => $callobj->{"stopkeys"}});
+    }
+    else
+    {
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_RECOGNIZE,
+		      "file" => $nextfile,
+		      ##  Timeout immediately if more playfiles await
+		      "timeout" => (scalar (@$filelist) ? 0 :
+				    $callobj->{"recognize_timeout"}),
+		      "flag" => $callobj->{"recognize_flag"}});
+    };
+};
+
+##  get_next_digit ($callobj, $timedout)
+##    -- Starts the next getdigit for call represented by $callobj,
+##       or responds to the CT client if finished with getting digits.
+##       If $timedout is true, a timeout has occurred on the getdigit.
+sub get_next_digit
+{
+    my ($callobj) = shift (@_);
+    my ($timedout) = shift (@_);
+    my ($return_digits, $done_reason, $len, $timeout, $ctfh, $ctinfo);
+    my ($ok, $msg);
+
+    ##  See if we're done:
+    ##  Check for max_digits, stopkeys, and timeout
+    ($done_reason, $len) = findmatch ($callobj->{"collected"},
+				      $callobj->{"stopkeys"},
+				      $callobj->{"max_dig"},
+				      $timedout);
+    if ($done_reason)
+    {
+	##  Done with the getdigit, so respond
+	if ($len)
+	{
+	    $return_digits = substr ($callobj->{"collected"}, 0, $len, "");
+	}
+	else
+	{
+	    $return_digits = "";
+	};
+	delete $callobj->{"timeout"};
+	delete $callobj->{"max_dig"};
+
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::GETDIG, Satc::GOTDIG))[0] || return;
+
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::GOTDIG,
+		     Satc::CALLID => $callobj->{"callid"},
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => "",
+		     Satc::REASON => $done_reason,
+		     Satc::DIGITS => $return_digits});
+	return;
+    };
+
+    ##  Need to start another getdigit
+    send_agi_client_msg
+      ($callobj, {"msgtype" => AGI_CLIENT_MSG_GETDIGIT,
+		  "timeout" => $callobj->{"timeout"}});
+};
+
+##  stopmedia ($callobj)
+##    -- Initiates a stopmedia on $callobj, which must be
+##       currently doing an AGI PLAY, RECORD, GETDIG, or PLAYDIG.
+##       Handles the fact that a VAMD state may not be complete yet.
+sub stopmedia
+{
+    my ($callobj) = shift (@_);
+    my ($vamd_state, $astmancmd, $agifh, $agiinfo, $ctinfo);
+
+    ##  Can't do a stopmedia unless "toself" values established
+    $ctinfo = $::Fh_to_clientobj->{$callobj->{"ctfh"}};
+    if (! defined ($ctinfo->{"toself"}))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "callid=[" . $callobj->{"callid"} .
+		    "] cannot perform stopmedia without toself defined");
+	return;
+    };
+
+    ##  See if still progressing through vamd setup/teardown
+    if ((defined ($vamd_state = $callobj->{"vamd_state"})) &&
+	$vamd_state != 3)
+    {
+	##  Still progressing to a vamd state, signal that
+	##  ultimate AGI command should not run by deleting it
+	##  from the vamd_q
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG,
+		    ("callid=[" . $callobj->{"callid"} .
+		     "] stopmedia found intermediate vamd state, " .
+		     "removing ultimate AGI command " .
+		     describe_agi_client_msg ($callobj->{"vamd_q_msg"})));
+	delete $callobj->{"vamd_q_bytes"};
+	delete $callobj->{"vamd_q_msg"};
+	return;
+    }
+
+    ##  Perform normal AGI command interruption.
+
+    ##  Disconnect the AGI handle from this call, as it
+    ##  is about to get closed, and we will get various
+    ##  irrelevant AGI stuff before this happens
+    if (defined ($agifh = $callobj->{"agifh"}) &&
+	defined ($agiinfo = $::Fh_to_clientobj->{$agifh}))
+    {
+	delete $agiinfo->{"callid"};
+	delete $agiinfo->{"uniqueid"};
+    };
+    delete $callobj->{"agifh"};
+
+    ##  Record that we are awaiting a redirect
+    $::AstMgrInfo->{"redirecting"}{$callobj->{"uniqueid"}} = 1;
+
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG,
+		("callid=[" . $callobj->{"callid"} .
+		 "] doing stopmedia via redirect"));
+
+    ##  Send it off
+    $astmancmd = {"msgtype" => ASTMGR_MSG_REDIRECT,
+		  "channel"=> $callobj->{"channel"},
+		  "callid" => $callobj->{"callid"},
+		  "context" => $ctinfo->{"toself"}{"context"},
+		  "exten" => $ctinfo->{"toself"}{"exten"},
+		  "priority" => $ctinfo->{"toself"}{"priority"},
+		 };
+    send_astmgr_msg ($astmancmd);
+};
+
+##  handle_msg_from_ct_client ($ctinfo, $bytes)
+##    -- Handles new message in $bytes coming from CT client
+##       described by $ctinfo
+sub handle_msg_from_ct_client
+{
+    my ($ctinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ok, $errmsg, $msg, $ctmsg, $uniqueid, @parts);
+    my ($type, $callid, $url, $load, $total, $regs, $agiinfo, $flag);
+    my ($astmancmd, $other_callid, $confid, $protocol, $agifh, $callobj);
+    my ($agi_msgtype, $toself, $maid, $from, $agimsg);
+
+    ##  First, parse it into its fields
+    $protocol = $ctinfo->{"protocol"};
+
+    ($ok, $errmsg, $ctmsg) = $protocol->decode ($bytes);
+    if (! $ok)
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, $errmsg . " from " .
+		    describe_fh ($ctinfo->{"fh"}) . " in msg " .
+		    dump_data ($bytes));
+	return;
+    };
+
+    $callid = $ctmsg->{Satc::CALLID};
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG,
+		(defined ($callid) ? "callid=[" . $callid . "] " : "") .
+		"parsed " . $protocol->describe_msg ($ctmsg));
+
+    ##  Now, branch based on message type
+    $type = $ctmsg->{"msgtype"};
+    if ($type == Satc::START)
+    {
+	##  Extract any toself parameter
+	$toself = $ctmsg->{Satc::TOSELF};
+	if (length ($toself))
+	{
+	    if ($toself =~ /^([^:]+):([^:]+):([^:]+)$/)
+	    {
+		$ctinfo->{"toself"} = {"context" => $1,
+				       "exten" => $2,
+				       "priority" => $3};
+	    }
+	    else
+	    {
+		($::Loglevel >= LOG_WARN)
+		  && logit (LOG_WARN,
+			"Invalid toself parameter in start message: \"" .
+			$toself . "\"");
+	    };
+	};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::STARTED,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::STOP)
+    {
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::STOPPED,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	$::Scom->close_on_flush ($ctinfo->{"fh"});
+    }
+    elsif ($type == Satc::REG)
+    {
+	$url = $ctmsg->{Satc::URL};
+	$url =~ s/\*/\.\*/g;
+	if (! length ($url))
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			$protocol->describe_msg ($ctmsg) .
+			" from " .
+			describe_fh ($ctinfo->{"fh"}) .
+			" has no url");
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::REGED,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "missing url"});
+	    return;
+	};
+	$load = $ctmsg->{Satc::LOAD};
+	if (defined ($ctinfo->{"allowin"}))
+	{
+	    register ($ctinfo->{"fh"}, $url, $load);
+	}
+	else
+	{
+	    $ctinfo->{"register"}{$url} = $load;
+	};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::REGED,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::UNREG)
+    {
+	$url = $ctmsg->{Satc::URL};
+	$url =~ s/\*/\.\*/g;
+	if (defined ($ctinfo->{"allowin"}))
+	{
+	    unregister ($ctinfo->{"fh"}, $url);
+	}
+	else
+	{
+	    delete $ctinfo->{"register"}{$url};
+	};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::UNREGED,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::ALLOWIN)
+    {
+	$ctinfo->{"allowin"} = 1;
+	if (defined ($regs = $ctinfo->{"register"}))
+	{
+	    foreach $url (keys (%$regs))
+	    {
+		register ($ctinfo->{"fh"}, $url, $regs->{$url});
+	    };
+	};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::ALLOWEDIN,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::STOPIN)
+    {
+	$ctinfo->{"allowin"} = 0;
+	if (defined ($regs = $ctinfo->{"register"}))
+	{
+	    foreach $url (keys (%$regs))
+	    {
+		unregister ($ctinfo->{"fh"}, $url);
+	    };
+	};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::STOPPEDIN,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::ANSWER)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::ANSWERED))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_ANSWERCALL});
+    }
+    elsif ($type == Satc::PLAY)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::PLAYED))[0] || return;
+	$callobj->{"playfiles"} = $ctmsg->{Satc::FILES};
+	##  stopkeys may need some translating
+	$callobj->{"stopkeys"} =
+	  translate_stopkeys ($ctmsg->{Satc::STOPKEYS});
+
+	##  Kick off the playfiles
+	$callobj->{"client_doing"} = $type;
+	play_next_file ($callobj);
+    }
+    elsif ($type == Satc::GETDIG)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::GOTDIG))[0] || return;
+	$callobj->{"timeout"} = $ctmsg->{Satc::TIMEOUT};
+	$callobj->{"max_dig"} = $ctmsg->{Satc::MAX_DIG};
+	##  stopkeys may need some translating
+	$callobj->{"stopkeys"} =
+	  translate_stopkeys ($ctmsg->{Satc::STOPKEYS});
+
+	##  It is permitted to accept this command while a conference
+	##  is active.  If so, this command simply gets queued until
+	##  after the conference completes.
+	$callobj->{"client_doing"} = $type;
+	if (! defined ($callobj->{"conference"}))
+	{
+	    ##  Kick off the getdigits
+	    get_next_digit ($callobj, 0);
+	};
+    }
+    elsif ($type == Satc::CLEARDIG)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::DIGCLEARED))[0] || return;
+	delete $callobj->{"collected"};
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::DIGCLEARED,
+		     Satc::CALLID => $callid,
+		     Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+    }
+    elsif ($type == Satc::HANGUP)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::HUNGUP))[0] || return;
+	##  Send the AGI hangup request
+	$callobj->{"client_doing"} = $type;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_HANGUP});
+    }
+    elsif ($type == Satc::RELEASE)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::RELEASE))[0] || return;
+	##  Either the callobj has an AGI filehandle, or not.
+	if (defined ($agifh = $callobj->{"agifh"}))
+	{
+	    ##  There is an AGI filehandle, so drop it, and
+	    ##  let fh_stopped handle the rest.
+	    if (! defined ($agiinfo = $::Fh_to_clientobj->{$agifh}))
+	    {
+		($::Loglevel >= LOG_EROR)
+		  && logit (LOG_EROR, "Cannot find agi clienobj for fh " .
+			    $agifh);
+	    }
+	    else
+	    {
+		$::Scom->unregister ($agiinfo->{"fh"});
+	    };
+	    fh_stopped ($agiinfo->{"fh"}, "release requested", 1);
+	}
+	else
+	{
+	    ##  There is no AGI filehandle, so disconnect the
+	    ##  callobj from the SATC client delete the callobj
+	    call_disconnected ($callid, 1);
+	    $uniqueid = $callobj->{"uniqueid"};
+	    delete $::Callid_to_callobj->{$callid};
+	    delete $::Uniqueid_to_callobj->{$uniqueid};
+	};
+    }
+    elsif ($type == Satc::MAKECALL)
+    {
+	##  Can't do a makecall without toself defined
+	if (! defined ($ctinfo->{"toself"}))
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			$protocol->describe_msg ($ctmsg) .
+			" from " .
+			describe_fh ($ctinfo->{"fh"}) .
+			" cannot execute without toself defined");
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::MADECALL,
+			 Satc::CALLID => -1,
+			 Satc::MAKECALL_ID => $ctmsg->{Satc::MAKECALL_ID},
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "toself undefined"});
+	    return;
+	}
+
+	##  Has: url (=to) from param (=makecall_id) timeout
+	##  Have to keep track of the makecall_id for when
+	##  it succeeds or fails so we know what to send back
+	$maid = "makecall_" . $ctmsg->{Satc::MAKECALL_ID} .
+	  "\@" . $ctinfo->{"fh"};
+	$astmancmd = {"msgtype" => ASTMGR_MSG_MAKECALL,
+		      "actionid" => $maid,
+		      "ctfh" => $ctinfo->{"fh"},
+		      "url" => $ctmsg->{Satc::URL},
+		      "from" => $ctmsg->{Satc::FROM},
+		      "mcid" => $ctmsg->{Satc::MAKECALL_ID},
+		      "exten" => $ctinfo->{"toself"}{"exten"},
+		      "priority" => $ctinfo->{"toself"}{"priority"},
+		      "context" => $ctinfo->{"toself"}{"context"},
+		      "timeout" => $ctmsg->{Satc::TIMEOUT}};
+	##  Record that we are awaiting makecall results from AstMgr
+	$::AstMgrInfo->{"callmaking"}{$maid} =
+	{"ctfh" => $ctinfo->{"fh"},
+	 "mcid" => $astmancmd->{"mcid"}};
+	##  Send it off
+	send_astmgr_msg ($astmancmd);
+    }
+    elsif ($type == Satc::RECORD)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+
+	##  Sanity-check the filepath extension
+	($ok, $msg, @parts) = split_record_filepath ($ctmsg->{Satc::FILE});
+	if (! $ok)
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			$protocol->describe_msg ($ctmsg) .
+			" from " .
+			describe_fh ($ctinfo->{"fh"}) .
+			" has bad filepath: $msg");
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::RECORDED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => $msg,
+			 Satc::REASON => Satc::RECORDED_REASON_UNDETERMINED,
+			 Satc::DURATION => 0});
+	    return;
+	};
+
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::RECORDED))[0] || return;
+	##  Kick off the recordfile
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"recording"} = $ctmsg->{Satc::FILE};
+	$callobj->{"record_max_time"} = $ctmsg->{Satc::MAX_TIME};
+	$callobj->{"record_max_silence"} = $ctmsg->{Satc::TIMEOUT};
+	$callobj->{"record_started"} = systime();
+	$callobj->{"stopkeys"} =
+	  translate_stopkeys ($ctmsg->{Satc::STOPKEYS});
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_RECORDFILE,
+		      "file" => $ctmsg->{Satc::FILE},
+		      "stopkeys" => $callobj->{"stopkeys"},
+		      "max_time" => $ctmsg->{Satc::MAX_TIME},
+		      "timeout" => $ctmsg->{Satc::TIMEOUT},
+		      "beep" => $ctmsg->{Satc::START_TONE},
+		     });
+    }
+    elsif ($type == Satc::BRIDGE)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::BRIDGED))[0] || return;
+	$other_callid = $ctmsg->{Satc::OTHER_CALLID};
+	$confid = (($callid < $other_callid) ? $callid : $other_callid);
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"conference"} = $confid;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_LISTENCALL,
+		      "confid" => $confid});
+    }
+    elsif ($type == Satc::TRANSFER)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::BRIDGED))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	defined ($flag = $ctmsg->{Satc::FLAG}) || ($flag = 0);
+	if ($flag == 1)
+	{
+	    $agi_msgtype = AGI_CLIENT_MSG_TRANSFER;
+	}
+	else
+	{
+	    $agi_msgtype = AGI_CLIENT_MSG_DIAL;
+	};
+	$from = $ctmsg->{Satc::FROM};
+	$agimsg = {"msgtype" => $agi_msgtype,
+		   "url" => $ctmsg->{Satc::URL},
+		   "from" => $from,
+		   "timeout" => $ctmsg->{Satc::TIMEOUT},
+		   "bridged" => (($flag == 2) ? 1 : 0)};
+	if (length ($from))
+	{
+	    ##  Send a SETCALLERID first
+	    $callobj->{"transfer_q_msg"} = $agimsg;
+	    send_agi_client_msg ($callobj,
+				 {"msgtype" => AGI_CLIENT_MSG_SETCALLERID,
+				  "from" => $from});
+	}
+	else
+	{
+	    send_agi_client_msg ($callobj, $agimsg);
+	};
+    }
+    elsif ($type == Satc::UNBRIDGE)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony
+	 ($ctinfo, $callid, $type,
+	  Satc::UNBRIDGED))[0] || return;
+
+	##  This may come in while still in the middle of
+	##  a conference, or the conference may be over.
+	if (! defined ($confid = $callobj->{"conference"}))
+	{
+	    ##  The conference is over
+	    send_ct_server_msg
+	      ($ctinfo,
+	       generic_ct_server_error_response
+	       (Satc::UNBRIDGED,
+		"Call is not in a conference", $callid));
+	}
+	else
+	{
+	    ##  The conference is still going
+	    ##  so try to stop it
+	    $callobj->{"client_doing"} = $type;
+	    $astmancmd = {"msgtype" => ASTMGR_MSG_STOPCONF,
+			  "confid" => $confid};
+	    ##  Send it off
+	    send_astmgr_msg ($astmancmd);
+	};
+    }
+    elsif ($type == Satc::PLAYDIG)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony
+	 ($ctinfo, $callid, $type,
+	  Satc::PLAYEDDIG))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_SENDDTMF,
+		      "digits" => $ctmsg->{Satc::DIGITS}});
+    }
+    elsif ($type == Satc::STOPMEDIA)
+    {
+	##  Stopmedia can be processed completely asynchronously,
+	##  so have to watch out for VAMD state not yet being attained
+
+
+	##  Simulate play stoppage by redirecting to this FastAGI again
+	##  thus stopping all current activity
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::STOPMEDIA))[0] || return;
+	stopmedia ($callobj);
+    }
+    elsif ($type == Satc::ASRSTART)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::ASRSTARTED))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_ASRSTART,
+		      "callid" => $ctmsg->{Satc::CALLID},
+		      "url" => $ctmsg->{Satc::URL}});
+    }
+    elsif ($type == Satc::ASRSTOP)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::ASRSTOPPED))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_ASRSTOP,
+		      "callid" => $ctmsg->{Satc::CALLID}});
+    }
+    elsif ($type == Satc::LOADGRAMMAR)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::LOADEDGRAMMAR))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"grammarname"} = $ctmsg->{Satc::GRAMMARNAME};
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_LOADGRAMMAR,
+		      "callid" => $ctmsg->{Satc::CALLID},
+		      "grammarname" => $ctmsg->{Satc::GRAMMARNAME},
+		      "file" => $ctmsg->{Satc::FILE}});
+    }
+    elsif ($type == Satc::UNLOADGRAMMAR)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::UNLOADEDGRAMMAR))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"grammarname"} = $ctmsg->{Satc::GRAMMARNAME};
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_UNLOADGRAMMAR,
+		      "callid" => $ctmsg->{Satc::CALLID},
+		      "grammarname" => $ctmsg->{Satc::GRAMMARNAME}});
+    }
+    elsif ($type == Satc::STARTGRAMMAR)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::STARTEDGRAMMAR))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"grammarname"} = $ctmsg->{Satc::GRAMMARNAME};
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_STARTGRAMMAR,
+		      "callid" => $ctmsg->{Satc::CALLID},
+		      "grammarname" => $ctmsg->{Satc::GRAMMARNAME}});
+    }
+    elsif ($type == Satc::STOPGRAMMAR)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::STOPPEDGRAMMAR))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	$callobj->{"grammarname"} = $ctmsg->{Satc::GRAMMARNAME};
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => AGI_CLIENT_MSG_STOPGRAMMAR,
+		      "callid" => $ctmsg->{Satc::CALLID},
+		      "grammarname" => $ctmsg->{Satc::GRAMMARNAME}});
+    }
+    elsif ($type == Satc::RECOGNIZE)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::RECOGNIZED))[0] || return;
+	$callobj->{"playfiles"} = $ctmsg->{Satc::FILES};
+	##  stopkeys is always anything
+	$callobj->{"stopkeys"} = "0123456789#*";
+	$callobj->{"recognize_timeout"} = $ctmsg->{Satc::TIMEOUT};
+	$callobj->{"recognize_flag"} = $ctmsg->{Satc::FLAG};
+	##  Kick off the recognitions
+	$callobj->{"client_doing"} = $type;
+	play_next_file ($callobj);
+    }
+    elsif ($type == Satc::RETURNVAR)
+    {
+	$callid = $ctmsg->{Satc::CALLID};
+	(($ok, $msg, $callobj) =
+	 check_todo_telephony ($ctinfo, $callid, $type,
+			       Satc::RETURNEDVAR))[0] || return;
+	$callobj->{"client_doing"} = $type;
+	$agi_msgtype = AGI_CLIENT_MSG_SETVARIABLE;
+	send_agi_client_msg
+	  ($callobj, {"msgtype" => $agi_msgtype,
+		      "var" => $ctmsg->{Satc::VAR},
+		      "value" => $ctmsg->{Satc::VALUE}});
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unsupported msg " .
+		    $protocol->describe_msg ($ctmsg) .
+		    " from " .
+		    describe_fh ($ctinfo->{"fh"}));
+    };
+};
+
+##  handle_bytes_from_ct_client ($ctinfo, $bytes)
+##    -- Handles new data sitting in $bytes
+##       that came in from SATC CT client $ctinfo.
+##       Calls handle_msg_from_ct_client ($msg_bytes) with each
+##       message it parses out.
+sub handle_bytes_from_ct_client
+{
+    my ($ctinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($oldbytes, $msgbytes);
+    my ($proto_obj, $protocol, $first_byte);
+
+    ##  Merge these bytes with previously buffered bytes
+    if (defined ($oldbytes = $ctinfo->{"buf"}))
+    {
+	$bytes = join ("", $oldbytes, $bytes);
+	delete $ctinfo->{"buf"};
+    };
+
+    ##  See if we need to make a protocol determination
+    if (! defined ($protocol = $ctinfo->{"protocol"}))
+    {
+	##  First byte should indicate the protocol
+	if (! length ($bytes))
+	{
+	    ##  Disconnect Premature
+	    ($::Loglevel >= LOG_WARN)
+	      && logit (LOG_WARN, "No data from client");
+	    return;
+	};
+	$first_byte = substr ($bytes, 0, 1);
+	foreach $proto_obj (@::CT_Protocols)
+	{
+	    if ($proto_obj->magic_byte() eq $first_byte)
+	    {
+		$protocol = $proto_obj;
+		$ctinfo->{"protocol"} = $proto_obj;
+	    };
+	};
+	if (! defined ($protocol))
+	{
+	    ##  No protocol detected
+	    ($::Loglevel >= LOG_WARN)
+	      && logit (LOG_WARN,
+			"Unrecognized protocol starting with byte 0x" .
+			sprintf ("%.2x", $first_byte) .
+			", supported protocols are: " .
+			join (", ",
+			      map ($_->protocol_name(), @::CT_Protocols)));
+	    return;
+	};
+    };
+
+    ##  Attempt to extract as many messages as possible from the bytes
+    ##  Invariant: $bytes contains unprocessed bytes,
+    while (defined ($msgbytes = $protocol->extract_message (\$bytes)))
+    {
+	##  Call the handler with the next message
+	handle_msg_from_ct_client ($ctinfo, $msgbytes);
+    };
+
+    ##  No further messages can be parsed out.
+    length ($bytes) && ($ctinfo->{"buf"} = $bytes);
+};
+
+##  incoming_call ($agiinfo)
+##    -- An AGI has finished filling in the initial data dump fields,
+##       and this is a new incoming call
+sub incoming_call
+{
+    my ($agiinfo) = shift (@_);
+    my ($ani, $dnis, $astdata, $regex, $fhmap, $dice, $index, $ctfh, $callid);
+    my ($callobj, $uniqueid, $ctinfo, $script_arg);
+    my (@fh_matches) = ();
+    my (@fh_loads) = ();
+    my ($load_total) = 0;
+
+    ##  Generate a callid
+    $callid = $::Next_callid++;
+
+    $uniqueid = $agiinfo->{"astdata"}{"agi_uniqueid"};
+
+    ##  Extract ani & dnis & arg
+    $astdata = $agiinfo->{"astdata"};
+    defined ($ani = $agiinfo->{"astdata"}{"agi_callerid"}) &&
+      length ($ani) &&
+	($ani ne "unknown")
+	  || defined ($ani = $agiinfo->{"astdata"}{"agi_calleridname"})
+	    || ($ani = "");
+    defined ($dnis = $agiinfo->{"astdata"}{"agi_dnid"}) &&
+      length ($dnis) &&
+	($dnis ne "unknown")
+	  || defined ($dnis = $agiinfo->{"astdata"}{"agi_extension"})
+	    || ($dnis = "");
+    defined ($script_arg = $agiinfo->{"astdata"}{"agi_network_script"})
+      || ($script_arg = "");
+
+    ##  Try to find DNIS matches
+    foreach $regex (keys (%$::Registrations))
+    {
+	if ($dnis =~ /^$regex$/)
+	{
+	    $fhmap = $::Registrations->{$regex}{"fh"};
+	    push (@fh_matches, keys (%$fhmap));
+	    push (@fh_loads, values (%$fhmap));
+	};
+    };
+    if (! scalar (@fh_matches))
+    {
+	##  No DNIS match found
+	($::Loglevel >= LOG_WARN)
+	  && logit (LOG_WARN,
+		    "callid=[" . $callid .
+		    "] has no DNIS match for DNIS=\"" .
+		    $dnis . "\", dropping");
+	$::Scom->unregister ($agiinfo->{"fh"});
+	fh_stopped ($agiinfo->{"fh"},
+		    "no DNIS match for DNIS=\"" . $dnis . "\"");
+	return;
+    };
+
+    ##  DNIS matches found, narrow down to one
+    grep ($load_total += $_, @fh_loads);
+    $dice = rand ($load_total);
+    $load_total = $fh_loads[0];
+    $index = 0;
+    while ($dice > $load_total)
+    {
+	++$index;
+	$load_total += $fh_loads[$index];
+    };
+    $ctfh = $fh_matches[$index];
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "callid=[" . $callid . "] new incoming assigned to " .
+	       "index " . $index . " of " . scalar (@fh_loads) . ": " .
+	       describe_fh ($ctfh));
+    };
+
+    ##  Got one match.
+    ##  Create the call object, attach it to the agi clientobj,
+    ##  and attach it to the SATC client,
+    $callobj = {"callid" => $callid,
+		"uniqueid" => $uniqueid,
+		"channel" => $agiinfo->{"astdata"}{"agi_channel"},
+		"agifh" => $agiinfo->{"fh"},
+		"ctfh" => $ctfh};
+    $::Callid_to_callobj->{$callid} = $callobj;
+    $::Uniqueid_to_callobj->{$uniqueid} = $callobj;
+    $agiinfo->{"callid"} = $callid;
+    $agiinfo->{"uniqueid"} = $uniqueid;
+    $ctinfo = $::Fh_to_clientobj->{$ctfh};
+    $ctinfo->{"callid"}{$callid} = 1;
+
+    ##  Send the incoming notification to the SATC client
+    send_ct_server_msg
+      ($ctinfo,
+       {Satc::MSGTYPE => Satc::INCOMING,
+	Satc::CALLID => $callid,
+	Satc::ANI => $ani,
+	Satc::DNIS => $dnis,
+	Satc::ARG => $script_arg});
+};
+
+##  outgoing_call ($agiinfo, $await_info);
+##    -- An AGI has finished filling in the initial data dump fields,
+##       and this call matches a makecall that we were waiting for.
+##       $await_info is what was in
+##          $::Fh_to_clientobj->{<ASTMGR>}{"callmaking"}{<maid>}
+sub outgoing_call
+{
+    my ($agiinfo) = shift (@_);
+    my ($await_info) = shift (@_);
+    my ($callid, $mcid, $ctfh, $ctinfo, $uniqueid, $callobj);
+
+    $mcid = $await_info->{"mcid"};
+    $ctfh = $await_info->{"ctfh"};
+
+    ##  Look for a matching makecall request
+    if (! defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+    {
+	##  CT client waiting for this went away, so ingore
+	if ($::Loglevel >= LOG_INFO)
+	{
+	    logit (LOG_INFO,
+		   "CT client " . $ctfh .
+		   "disappeared for makecall mcid=" . $mcid);
+	};
+	$::Scom->unregister ($agiinfo->{"fh"});
+	fh_stopped ($agiinfo->{"fh"}, "makecall abandoned");
+	return;
+    };
+
+    ##  Generate a callid
+    $callid = $::Next_callid++;
+
+    $uniqueid = $agiinfo->{"astdata"}{"agi_uniqueid"};
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "callid=[" . $callid . "] new outgoing mcid=" .
+	       $mcid . " assigned to " .
+	       describe_fh ($ctfh));
+    };
+
+    ##  Create the call object, attach it to the agi clientobj,
+    ##  and attach it to the SATC client,
+    $callobj = {"callid" => $callid,
+		"uniqueid" => $uniqueid,
+		"channel" => $agiinfo->{"astdata"}{"agi_channel"},
+		"agifh" => $agiinfo->{"fh"},
+		"ctfh" => $ctfh};
+    $::Callid_to_callobj->{$callid} = $callobj;
+    $::Uniqueid_to_callobj->{$uniqueid} = $callobj;
+    $agiinfo->{"callid"} = $callid;
+    $agiinfo->{"uniqueid"} = $uniqueid;
+    $ctinfo = $::Fh_to_clientobj->{$ctfh};
+    $ctinfo->{"callid"}{$callid} = 1;
+
+    ##  Send the makecall result to the SATC client
+    send_ct_server_msg
+      ($ctinfo,
+       {Satc::MSGTYPE => Satc::MADECALL,
+	Satc::CALLID => $callid,
+	Satc::MAKECALL_ID => $mcid,
+	Satc::STATUS => Satc::RESPONSE_OK,
+	Satc::MSG => ""});
+};
+
+##  handle_interrupted_command ($callobj)
+##    -- Process an interrupted command by either
+##       returning the match of the vamd event, or
+##       the fact that the command was interrupted with no match.
+sub handle_interrupted_command
+{
+    my ($callobj) = shift (@_);
+    my ($callid) = $callobj->{"callid"};
+    my ($ok, $msg, $ct_doing, $result_msg, $ctinfo, $ctfh);
+    my ($found, $len, $reason, $returndigits);
+
+    if (defined ($ct_doing = $callobj->{"client_doing"}) &&
+	(($ct_doing == Satc::PLAY) ||
+	 ($ct_doing == Satc::RECOGNIZE) ||
+	 ($ct_doing == Satc::GETDIG) ||
+	 ($ct_doing == Satc::RECORD)))
+    {
+	##  See if there is a match
+	($found, $len) =
+	  findmatch ($callobj->{"collected"},
+		     $callobj->{"stopkeys"},
+		     $callobj->{"max_dig"});
+
+	##  Handle each command response individually
+	if ($ct_doing == Satc::PLAY)
+	{
+	    if ((($ok, $msg, $ctinfo) = check_result_telephony
+		 ($callobj, Satc::PLAY, Satc::PLAYED))[0])
+	    {
+		$reason = ($found ? Satc::PLAYEDFILE_REASON_DTMF_PRESSED :
+			   Satc::PLAYEDFILE_REASON_STOP_REQUESTED);
+		$result_msg =
+		{Satc::MSGTYPE => Satc::PLAYED,
+		 Satc::CALLID => $callid,
+		 Satc::STATUS => Satc::RESPONSE_OK,
+		 Satc::MSG => "",
+		 Satc::REASON => $reason};
+	    };
+
+	    delete $callobj->{"playfiles"};
+	    delete $callobj->{"playing"};
+	}
+	elsif ($ct_doing == Satc::RECOGNIZE)
+	{
+	    if ((($ok, $msg, $ctinfo) =
+		 check_result_telephony
+		 ($callobj, Satc::RECOGNIZE,
+		  Satc::RECOGNIZED))[0])
+	    {
+		$result_msg =
+		{Satc::MSGTYPE => Satc::RECOGNIZED,
+		 Satc::CALLID => $callid,
+		 Satc::STATUS => Satc::RESPONSE_OK,
+		 Satc::MSG => "",
+		 Satc::REASON =>
+		 Satc::RECOGNIZED_REASON_STOP_REQUESTED};
+	    };
+	    delete $callobj->{"playfiles"};
+	    delete $callobj->{"playing"};
+	    delete $callobj->{"recognize_timeout"};
+	    delete $callobj->{"recognize_flag"};
+	}
+	elsif ($ct_doing == Satc::GETDIG)
+	{
+	    if ((($ok, $msg, $ctinfo) =
+		 check_result_telephony
+		 ($callobj, Satc::GETDIG,
+		  Satc::GOTDIG))[0])
+	    {
+		$reason = Satc::GOTDIGIT_REASON_STOP_REQUESTED;
+		$returndigits = "";
+		##  Extract returndigits if they exist
+		if ($found)
+		{
+		    $returndigits =
+		      substr ($callobj->{"collected"}, 0, $len, "");
+		    ($found == 1) &&
+		      ($reason = Satc::GOTDIGIT_REASON_TERM_PRESSED);
+		    ($found == 2) &&
+		      ($reason = Satc::GOTDIGIT_REASON_MAX_DIGITS);
+		};
+		$result_msg =
+		{Satc::MSGTYPE => Satc::GOTDIG,
+		 Satc::CALLID => $callid,
+		 Satc::STATUS => Satc::RESPONSE_OK,
+		 Satc::MSG => "",
+		 Satc::REASON => $reason,
+		 Satc::DIGITS => $returndigits};
+	    };
+	    delete $callobj->{"timeout"};
+	    delete $callobj->{"max_dig"};
+	}
+	elsif ($ct_doing == Satc::RECORD)
+	{
+	    if ((($ok, $msg, $ctinfo) =
+		 check_result_telephony
+		 ($callobj, Satc::RECORD,
+		  Satc::RECORDED))[0])
+	    {
+		$reason = Satc::RECORDED_REASON_STOP_REQUESTED;
+		$returndigits = "";
+		if ($found)
+		{
+		    $returndigits =
+		      substr ($callobj->{"collected"}, 0, $len, "");
+		    $returndigits = substr ($returndigits,
+					    length ($returndigits) - 1);
+		    $reason = Satc::RECORDED_REASON_DTMF_PRESSED;
+		};
+		$result_msg =
+		{Satc::MSGTYPE => Satc::RECORDED,
+		 Satc::CALLID => $callid,
+		 Satc::STATUS => Satc::RESPONSE_OK,
+		 Satc::MSG => "",
+		 Satc::REASON => $reason,
+		 Satc::DURATION =>
+		 int ((systime() - $callobj->{"record_started"}) * 1000),
+		 Satc::DIGITS => $returndigits};
+	    };
+	    delete $callobj->{"record_started"};
+	    delete $callobj->{"recording"};
+	}
+	else
+	{
+	    $result_msg = generic_ct_server_error_response
+	      ($ct_doing, "stop requested", $callid);
+	    if (defined ($ctfh = $callobj->{"ctfh"}))
+	    {
+		if (! defined ($ctinfo =
+			       $::Fh_to_clientobj->{$ctfh}))
+		{
+		    ($::Loglevel >= LOG_EROR)
+		      && logit (LOG_EROR,
+				"callid=[" . $callid .
+				"] ". "after redirect " .
+				"SATC client has fh=\"" . $ctfh .
+				"\" but no clientobj found");
+		};
+	    };
+	};
+
+	if (defined ($ctinfo) && defined ($result_msg))
+	{
+	    send_ct_server_msg ($ctinfo, $result_msg);
+	};
+    };
+
+    ##  Perform post-redirect call state cleanup
+    delete $callobj->{"agi_doing"};
+    if (defined ($callobj->{"confOK"}))
+    {
+	if (defined ($ctinfo) ||
+	    (defined ($ctfh = $callobj->{"ctfh"}) &&
+	     defined ($ctinfo = $::Fh_to_clientobj->{$ctfh})))
+	{
+	    ##  Notify SATC client of conference loss
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::EXITEDCONF,
+			 Satc::CALLID => $callid});
+	};
+	delete $callobj->{"confOK"};
+    };
+    delete $callobj->{"conference"};
+}
+
+##  $is_one = potential_outbound_incoming_leg ($agiinfo);
+##    -- Returns true if the AGI filehandle clientobj $agiinfo
+##       is potentially a new inbound leg of a new outbound call
+##       whose uniqueid hasn't yet been established
+sub potential_outbound_incoming_leg
+{
+    ##  Extract context, extension, and priority from AGI call
+    my ($agiinfo) = shift (@_);
+    my ($astdata) = $agiinfo->{"astdata"};
+    my ($context) = $astdata->{"agi_context"};
+    my ($extension) = $astdata->{"agi_extension"};
+    my ($priority) = $astdata->{"agi_priority"};
+    my ($ctfh, $ctinfo, $toself_info);
+
+    ##  See if any CT clients match this in their "toself"
+    foreach $ctfh (keys (%$::Ct_Client_Fhs))
+    {
+	$ctinfo = $::Fh_to_clientobj->{$ctfh};
+	if (defined ($toself_info = $ctinfo->{"toself"}))
+	{
+	    ##  Can't match against priority because it can be
+	    ##  different by the time the call comes in via AGI
+	    if (($toself_info->{"context"} eq $context) &&
+		($toself_info->{"exten"} eq $extension))
+	    {
+		return 1;
+	    };
+	};
+    };
+    return 0;
+}
+
+##  handle_msg_from_agi_client ($agiinfo, $msg)
+##    -- Handles new message $msg
+##       that came in from AGI client in $agiinfo (a clientobj)
+sub handle_msg_from_agi_client
+{
+    my ($agiinfo) = shift (@_);
+    my ($data) = shift (@_);
+    my ($ok, $msg, $field, $value, $agi_success, $agi_ok, $agi_fail_msg);
+    my ($agi_doing, $callid, $ctfh, $ctinfo, $ct_doing, $result, $values);
+    my ($fmt, $endpos, $gotdigits, $callerid, $await_info, $comment);
+    my ($reason, $result_msg, $callobj, $duration, $fh, $digits, $grammarname);
+    my ($vamd_state, $uniqueid, $cidname);
+
+    chomp ($data);  ##  AGI always ends with a "\n"
+
+    ##  See if this AGI is still filling in the initial data dump
+    if (! defined ($agiinfo->{"initok"}))
+    {
+	##  Still filling in initial data dump
+	if ($data =~ /^\s*$/)
+	{
+	    ##  Initial data dump is done.
+	    $agiinfo->{"initok"} = 1;
+
+	    ##  Get its callerid/uniqueid info
+	    $callerid = $agiinfo->{"astdata"}{"agi_callerid"};
+	    $cidname = $agiinfo->{"astdata"}{"agi_calleridname"};
+	    $uniqueid = $agiinfo->{"astdata"}{"agi_uniqueid"};
+	    if ((! defined ($callerid)) && (! defined ($cidname))
+		|| (! defined ($uniqueid)))
+	    {
+		if ($::Loglevel >= LOG_CRIT)
+		{
+		    $fmt = "New AGI connection " . $agiinfo->{"fh"} .
+		      " missing agi_callerid/agi_calleridname " .
+			"or agi_uniqueid, fields are:";
+		    foreach $field (keys (%{$agiinfo->{"astdata"}}))
+		    {
+			$fmt .= " " . $field . "=" .
+			  $agiinfo->{"astdata"}{$field};
+		    };
+		};
+		$::Scom->unregister ($agiinfo->{"fh"});
+		delete $::Fh_to_clientobj->{$agiinfo->{"fh"}};
+		return;
+	    };
+
+	    ##  Now determine what this call is.
+	    ##  It is one of:
+	    ##    - A new incoming call
+	    ##    - A new call resulting from a MAKECALL
+	    ##    - An existing call that has been redirected
+
+	    ##  Check for inbound leg of a makecall
+	    if (defined ($await_info =
+			 $::AstMgrInfo->{"awaiting"}{$uniqueid}))
+	    {
+		##  This is a makecall response call startup
+		delete $::AstMgrInfo->{"awaiting"}{$uniqueid};
+		outgoing_call ($agiinfo, $await_info);
+	    }
+	    elsif (defined ($::AstMgrInfo->{"redirecting"}{$uniqueid}))
+	    {
+		##  This is a redirect of an existing call
+		delete $::AstMgrInfo->{"redirecting"}{$uniqueid};
+		##  Attach the call to this AGI filehandle
+		if (! defined ($callobj = $::Uniqueid_to_callobj->{$uniqueid}))
+		{
+		    if ($::Loglevel >= LOG_INFO)
+		    {
+			logit (LOG_INFO,
+			       "Call for redirected uniqueid " . $uniqueid .
+			       "disappeared, discarding");
+			$::Scom->unregister ($agiinfo->{"fh"});
+			return;
+		    };
+		};
+		$callid = $callobj->{"callid"};
+		$agiinfo->{"callid"} = $callid;
+		$agiinfo->{"uniqueid"} = $uniqueid;
+		$callobj->{"agifh"} = $agiinfo->{"fh"};
+		if ($::Loglevel >= LOG_INFO)
+		{
+		    logit (LOG_INFO,
+			   "callid=[$callid] Reattached to " .
+			   $agiinfo->{"fh"});
+		};
+
+		##  Send a response to whatever command was running
+		handle_interrupted_command ($callobj);
+	    }
+	    elsif (potential_outbound_incoming_leg ($agiinfo))
+	    {
+		##  Have to wait to see if a uniqueid will end
+		##  up matching it from a new outbound call
+		$::AstMgrInfo->{"received"}{$uniqueid} =
+		{
+		 "agifh" => $agiinfo->{"fh"},
+		 "when" => time,
+		};
+		($::Loglevel >= LOG_INFO)
+		  && logit (LOG_INFO,
+			    "Incoming call with uniqueid=" . $uniqueid .
+			    " matches no awaiting makecall inbound leg, " .
+			    " but could in future.  Storing in \"received\".");
+	    }
+	    else
+	    {
+		##  This is a new incoming call
+		incoming_call ($agiinfo);
+	    };
+	}
+	elsif ($data =~ /^\s*(\S+)\:\s+(.+)?\s*$/)
+	{
+	    ##  Got more data fields
+	    $field = $1;
+	    $value = $2;
+	    $agiinfo->{"astdata"}{$field} = $value;
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG,
+			$agiinfo->{"fh"} .
+			" initial data \"" .
+			$field . "\" = " .
+			(defined ($value) ? "\"" . $value . "\"" : "undef"));
+	}
+	else
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			"callid=[" . $agiinfo->{"callid"} .
+			"] unparsable initial data dump line from " .
+			describe_fh ($agiinfo->{"fh"}) .
+			": \"" . $data . "\", ignoring");
+	};
+	return;
+    };
+
+    ##  Looking for a normal command response
+    if (! defined ($callid = $agiinfo->{"callid"}))
+    {
+	##  This AGI filehandle has been detached from its call
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "Ignoring " . $data .
+		   " from AGI filehandle, call has been disconnected");
+	};
+	return;
+    };
+    if (! defined ($callobj = $::Callid_to_callobj->{$callid}))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "[" . $callid . "] " .
+		   "in handle_msg_from_agi_client() call object missing");
+	};
+	return;
+    };
+
+    ##  This should be an AGI response to a previously sent request,
+    ##  either a regular request or a vamd Monitor start/stop.
+    ##  Or, it could be a hangup.
+    ($agi_ok, $msg, $result, $comment, $values) =
+      parse_agi_result ($data);
+    defined ($msg) && length ($msg) && ($agi_fail_msg = $msg);
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	$fmt = "callid=[" . $agiinfo->{"callid"} .
+	  "] AGI result=";
+	if ($agi_ok == -1)
+	{
+	    $fmt .= "HANGUP";
+	}
+	elsif ($agi_ok == 0)
+	{
+	    $fmt .= "ERROR: $agi_fail_msg";
+	}
+	else
+	{
+	    $fmt .= (defined ($result) ? $result : "undef");
+	    if (defined ($comment))
+	    {
+		$fmt .= " comment=" . $comment;
+	    };
+	    if (defined ($values))
+	    {
+		$fmt .= " values:";
+		foreach $field (keys (%$values))
+		{
+		    $fmt .= " $field=" . $values->{"$field"};
+		};
+	    };
+	};
+	logit (LOG_DBUG, $fmt);
+    };
+
+    ##  Handle all hangups
+    if ($agi_ok == -1)
+    {
+	agi_client_finished ($agiinfo, 0);
+	return;
+    };
+
+    ##  Verify channel state
+    if (! defined ($agi_doing = $callobj->{"agi_doing"}))
+    {
+	($::Loglevel >= LOG_CRIT)
+	  && logit (LOG_CRIT,
+		    "callid=[" . $callid .
+		    "] received AGI result with no outstanding command: " .
+		    $data);
+	return;
+    };
+
+    ##  Take action based on the AGI client's outstanding command
+    if (defined ($vamd_state = $callobj->{"vamd_state"}) &&
+	($vamd_state != 3))
+    {
+	##  Processing a VAMD state change
+	if (($vamd_state == 2) || ($vamd_state == -1))
+	{
+	    ##  Monitor started or stopped
+	    if ($vamd_state == 2)
+	    {
+		$callobj->{"vamd_state"} = 3;
+	    }
+	    else
+	    {
+		delete $callobj->{"vamd_state"}
+	    };
+
+	    ##  Time to run the real AGI command
+	    ##  unless it has been deleted due to a VAMD signal
+	    if (defined ($callobj->{"vamd_q_bytes"}))
+	    {
+		##  Regular AGI command ready to run
+		($::Loglevel >= LOG_DBUG)
+		  && logit
+		    (LOG_DBUG,
+		     ("callid=[" . $callid . "] snd " .
+		      describe_agi_client_msg ($callobj->{"vamd_q_msg"}) .
+		      " to "  . describe_fh ($agiinfo->{"fh"})));
+		send_bytes ($agiinfo->{"fh"}, $callobj->{"vamd_q_bytes"});
+	    }
+	    else
+	    {
+		##  Regular AGI command was deleted,
+		##  must return interrupted result
+		handle_interrupted_command ($callobj);
+	    };
+	}
+	else
+	{
+	    logit (LOG_EROR, "[" . $callid . "] " .
+		   "invalid vamd_state = " . $vamd_state .
+		   " upon completion of AGI start/stop monitor");
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_ANSWERCALL)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::ANSWER,
+	  Satc::ANSWERED, $agi_fail_msg))[0] || return;
+
+	if ($result == 0)
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ANSWERED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ANSWERED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "channel failure"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_PLAYFILE)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::PLAY,
+	  Satc::PLAYED, $agi_fail_msg))[0] || return;
+
+	$agi_success = 1;
+	if ($result == -1)
+	{
+	    ##  Handle play failures as hangups
+	    ##  $agi_success = 0;
+	    ##  $agi_fail_msg = "playfile failure";
+	    agi_client_finished ($agiinfo, 0);
+	    return;
+	};
+	if (! defined ($endpos = $values->{"endpos"}))
+	{
+	    $agi_success = 0;
+	    $agi_fail_msg = "playfile response has no \"endpos\"";
+	};
+	if ($agi_success)
+	{
+	    if ($endpos == 0)
+	    {
+		##  Could't open the playfile
+		($::Loglevel >= LOG_WARN)
+		  && logit (LOG_WARN,
+			    "callid=[" . $callid .
+			    "] failed opening playfile \"" .
+			    $callobj->{"playing"} . "\"");
+	    };
+	    if ($result > 0)
+	    {
+		##  Got a digit termination
+		defined ($callobj->{"collected"})
+		  || ($callobj->{"collected"} = "");
+		$callobj->{"collected"} .= chr ($result);
+	    };
+	    delete $callobj->{"playing"};
+	    ##  Move on to next file to play
+	    play_next_file ($callobj);
+	}
+	else
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::PLAYED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => $agi_fail_msg,
+			 Satc::REASON => 0});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_RECOGNIZE)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::RECOGNIZE,
+	  Satc::RECOGNIZED, $agi_fail_msg))[0] || return;
+
+	$agi_success = 1;
+	if ($result == -1)
+	{
+	    ##  Handle recognize failures as hangups
+	    ## $agi_success = 0;
+	    ## $agi_fail_msg = "recognize failure";
+	    agi_client_finished ($agiinfo, 0);
+	    return;
+	};
+	if (! defined ($endpos = $values->{"endpos"}))
+	{
+	    $agi_success = 0;
+	    $agi_fail_msg = "recognize response has no \"endpos\"";
+	};
+	if ($agi_success)
+	{
+	    if ($endpos == 0)
+	    {
+		##  Could't open the playfile
+		($::Loglevel >= LOG_WARN)
+		  && logit (LOG_WARN,
+			    "callid=[" . $callid .
+			    "] failed opening playfile \"" .
+			    $callobj->{"playing"} . "\"");
+	    };
+	    if ($result > 0)
+	    {
+		##  Got a digit termination
+		defined ($callobj->{"collected"})
+		  || ($callobj->{"collected"} = "");
+		$callobj->{"collected"} .= chr ($result);
+	    };
+	    delete $callobj->{"playing"};
+	    ##  Move on to next file to play
+	    play_next_file ($callobj);
+	}
+	else
+	{
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::RECOGNIZED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => $agi_fail_msg,
+			 Satc::REASON => 0});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_GETDIGIT)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::GETDIG,
+	  Satc::GOTDIG, $agi_fail_msg))[0] || return;
+
+	if ($result == -1)
+	{
+	    ##  Handle getdigit failures as hangups
+	    ## send_ct_server_msg
+	    ##  ($ctinfo, {Satc::MSGTYPE => Satc::GOTDIG,
+	    ##    Satc::CALLID => $callid,
+	    ##    Satc::STATUS => Satc::RESPONSE_FAIL,
+	    ##    Satc::MSG => "WAIT FOR DIGIT returned -1",
+	    ##    Satc::DIGITS => "",
+	    ##    Satc::REASON => 0});
+	    agi_client_finished ($agiinfo, 0);
+	    return;
+	}
+	elsif ($result > 0)
+	{
+	    ##  Got a digit
+	    defined ($callobj->{"collected"})
+	      || ($callobj->{"collected"} = "");
+	    $callobj->{"collected"} .= chr ($result);
+	    ##  Move on to next digit
+	    get_next_digit ($callobj, 0);
+	}
+	elsif ($result == 0)
+	{
+	    ##  Timeout
+	    defined ($callobj->{"collected"})
+	      || ($callobj->{"collected"} = "");
+	    get_next_digit ($callobj, 1);
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_RECORDFILE)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::RECORD,
+	  Satc::RECORDED, $agi_fail_msg))[0] || return;
+
+	$reason = Satc::RECORDED_REASON_UNDETERMINED;
+	$agi_success = 1;
+	if ($result == -1)
+	{
+	    if (defined ($endpos = $values->{"endpos"}) &&
+		defined ($comment) && ($comment eq "hangup"))
+	    {
+		##  A hangup and end-of-recording all rolled into one
+	    }
+	    else
+	    {
+		$agi_success = 0;
+		$agi_fail_msg = "recordfile failure";
+	    };
+	};
+	if (! defined ($endpos = $values->{"endpos"}))
+	{
+	    $agi_success = 0;
+	    $agi_fail_msg = "recordfile response has no \"endpos\"";
+	};
+	if ($agi_success)
+	{
+	    $duration = int ($endpos / 8);
+	    if (defined ($comment) && ($comment eq "hangup"))
+	    {
+		##  Got record termination because of hangup
+		$reason = Satc::RECORDED_REASON_HANGUP;
+	    }
+	    elsif (defined ($comment) && ($comment eq "timeout"))
+	    {
+		##  Alas, there is no definitive way to distinguish between
+		##  max silence and max record time, so must guess.
+		if ($duration > ($callobj->{"record_max_time"} - 1000))
+		{
+		    $reason = Satc::RECORDED_REASON_MAX_TIME;
+		}
+		elsif ($duration < ($callobj->{"record_max_silence"} + 1000))
+		{
+		    $reason = Satc::RECORDED_REASON_NO_AUDIO_TIMEOUT;
+		}
+		else
+		{
+		    $reason = Satc::RECORDED_REASON_SILENCE;
+		};
+	    }
+	    elsif ($result > 0)
+	    {
+		##  Got a digit termination
+		$reason = Satc::RECORDED_REASON_DTMF_PRESSED;
+		$digits = chr ($result);
+	    }
+	    ##  Send success response
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::RECORDED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => "",
+			 Satc::REASON => $reason,
+			 Satc::DURATION => $duration,
+			 Satc::DIGITS => (defined ($digits) ? $digits : "")});
+	    ##  If due to hangup, process the hangup (since asterisk
+	    ##  doesn't seem to ever drop the AGI connection)
+	    if ($reason == Satc::RECORDED_REASON_HANGUP)
+	    {
+		##  Create my own hangup
+		if (defined ($fh = $callobj->{"agifh"}))
+		{
+		    $::Scom->unregister ($fh);
+		    fh_stopped ($fh, "hungup during recording");
+		};
+	    };
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::RECORDED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => $agi_fail_msg,
+			 Satc::REASON => $reason,
+			 Satc::DURATION => 0});
+	};
+	if ($reason != Satc::RECORDED_REASON_HANGUP)
+	{
+	    delete $callobj->{"record_started"};
+	    delete $callobj->{"recording"};
+	    delete $callobj->{"record_max_time"};
+	    delete $callobj->{"record_max_silence"};
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_LISTENCALL)
+    {
+	delete $callobj->{"conference"};
+	##  This is an ususual case.
+	##  In Asterisk, an AGI return result from a MeetMe call
+	##  won't happen until the conference is terminated.
+	##  So, either the conference succeeded, in which case
+	##  $callobj->{"confOK"} is defined meaning that a successful
+	##  reply to the CT LISTENCALL has already been sent and the
+	##  client might now be waiting on an UNLISTENCALL or GETDIGIT, or
+	##  a failure has occurred, and we must return failure to the
+	##  original CT LISTENCALL.
+	if (defined ($callobj->{"confOK"}))
+	{
+	    delete $callobj->{"confOK"};
+
+	    ##  Successful response to CT LISTENCALL was sent previously.
+	    ##  See if an UNLISTENCALL or GETDIGIT is waiting,
+	    ##  or if I should generate a LEFTCONF event.
+	    if (defined ($ctfh = $callobj->{"ctfh"})
+		&& (defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+		&& ($callobj->{"client_doing"} == Satc::UNBRIDGE))
+	    {
+		##  An unlistencall is waiting, so respond to it
+		(($ok, $msg, $ctinfo) =
+		 check_result_telephony
+		 ($callobj, Satc::UNBRIDGE,
+		  Satc::UNBRIDGED, $agi_fail_msg))[0]
+		    || return;
+		send_ct_server_msg
+		  ($ctinfo, {Satc::MSGTYPE => Satc::UNBRIDGED,
+			     Satc::CALLID => $callid,
+			     Satc::STATUS => Satc::RESPONSE_OK,
+			     Satc::MSG => ""});
+	    }
+	    elsif (defined ($ctfh = $callobj->{"ctfh"})
+		&& (defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+		&& ($callobj->{"client_doing"} == Satc::GETDIG))
+	    {
+		##  This is a queued up getdigit that's been awaiting
+		##  the termination of this conference.
+		##  So, stick the digit that terminated the conference
+		##  in the list, and start the digit collection process.
+		if (defined ($callobj->{"collected"}))
+		{
+		    $callobj->{"collected"} .= "#";
+		}
+		else
+		{
+		    $callobj->{"collected"} = "#";
+		};
+		get_next_digit ($callobj, 0);
+	    }
+	    elsif (defined ($ctfh = $callobj->{"ctfh"})
+		   && (defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+		   && (! defined ($callobj->{"client_doing"})))
+	    {
+		##  Need to generate a LEFTCONF event
+		send_ct_server_msg
+		  ($ctinfo, {Satc::MSGTYPE => Satc::EXITEDCONF,
+			     Satc::CALLID => $callid});
+	    }
+	    else
+	    {
+		##  Got a finish of a conference, but CT doing
+		##  something other than UNLISTENCALL or GETDIGIT (??!!)
+		 check_result_telephony
+		   ($callobj, Satc::UNBRIDGE,
+		    Satc::UNBRIDGED, $agi_fail_msg);
+	    };
+	}
+	else
+	{
+	    ##  No response given to CT LISTENCALL yet, so must be failure
+	    (($ok, $msg, $ctinfo) =
+	     check_result_telephony
+	     ($callobj, Satc::BRIDGE,
+	      Satc::BRIDGED, $agi_fail_msg))[0] || return;
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::BRIDGED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_SENDDTMF)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::PLAYDIG,
+	  Satc::PLAYEDDIG, $agi_fail_msg))[0] || return;
+
+	if ($result == -1)
+	{
+	    ##  Handle playdigit failures as hangups
+	    agi_client_finished ($agiinfo, 0);
+	    return;
+	};
+	if ($result >= 0)
+	{
+	    ##  Success
+	    delete $callobj->{"conference"};
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::PLAYEDDIG,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    delete $callobj->{"conference"};
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::PLAYEDDIG,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_SETCALLERID)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::TRANSFER,
+	  Satc::TRANSFERED, $agi_fail_msg))[0] || return;
+
+	##  Always followed by one of the transfers, stored in transfer_q_msg
+	send_agi_client_msg ($callobj, $callobj->{"transfer_q_msg"});
+	return;
+    }
+    elsif (($agi_doing == AGI_CLIENT_MSG_DIAL) ||
+	   ($agi_doing == AGI_CLIENT_MSG_TRANSFER))
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::TRANSFER,
+	  Satc::TRANSFERED, $agi_fail_msg))[0] || return;
+
+	##  Initial result doesn't seem to have any information
+	##  Record that we are awaiting a "dialing"
+	$::AstMgrInfo->{"dialing"}{$callobj->{"uniqueid"}} =
+	  $callobj->{"callid"};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_ASRSTART)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::ASRSTART,
+	  Satc::ASRSTARTED, $agi_fail_msg))[0] || return;
+
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ASRSTARTED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ASRSTARTED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_ASRSTOP)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::ASRSTOP,
+	  Satc::ASRSTOPPED, $agi_fail_msg))[0] || return;
+
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ASRSTOPPED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::ASRSTOPPED,
+			 Satc::CALLID => $callid,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_LOADGRAMMAR)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::LOADGRAMMAR,
+	  Satc::LOADEDGRAMMAR, $agi_fail_msg))[0] || return;
+
+	$grammarname = $callobj->{"grammarname"};
+	delete $callobj->{"grammarname"};
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::LOADEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::LOADEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_UNLOADGRAMMAR)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::UNLOADGRAMMAR,
+	  Satc::UNLOADEDGRAMMAR, $agi_fail_msg))[0] || return;
+
+	$grammarname = $callobj->{"grammarname"};
+	delete $callobj->{"grammarname"};
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::UNLOADEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::UNLOADEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_STARTGRAMMAR)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::STARTGRAMMAR,
+	  Satc::STARTEDGRAMMAR, $agi_fail_msg))[0] || return;
+
+	$grammarname = $callobj->{"grammarname"};
+	delete $callobj->{"grammarname"};
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::STARTEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::STARTEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_STOPGRAMMAR)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::STOPGRAMMAR,
+	  Satc::STOPPEDGRAMMAR, $agi_fail_msg))[0] || return;
+
+	$grammarname = $callobj->{"grammarname"};
+	delete $callobj->{"grammarname"};
+	if ($result >= 0)
+	{
+	    ##  Success
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::STOPPEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	}
+	else
+	{
+	    ##  Failure
+	    send_ct_server_msg
+	      ($ctinfo, {Satc::MSGTYPE => Satc::STOPPEDGRAMMAR,
+			 Satc::CALLID => $callid,
+			 Satc::GRAMMARNAME => $grammarname,
+			 Satc::STATUS => Satc::RESPONSE_FAIL,
+			 Satc::MSG => "return result = $result"});
+	};
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_SETVARIABLE)
+    {
+	(($ok, $msg, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::RETURNVAR,
+	  Satc::RETURNEDVAR, $agi_fail_msg))[0] || return;
+
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => Satc::RETURNEDVAR,
+		     Satc::CALLID => $callid});
+    }
+    elsif ($agi_doing == AGI_CLIENT_MSG_HANGUP)
+    {
+	agi_client_finished ($agiinfo, 0);
+	return;
+    }
+    else
+    {
+	($::Loglevel >= LOG_CRIT)
+	  && logit (LOG_CRIT,
+		    "callid=[" . $callid .
+		    "] unsupported AGI client command " .
+		    $::AGIClientMsgDescription[$agi_doing] .
+		    " (" . $agi_doing . ") from " .
+		    describe_fh ($agiinfo->{"fh"}) .
+		    " ignoring");
+	return;
+    };
+};
+
+##  makecall_failed ($fh, $mcid, $values)
+##    -- A makecall initiated by the client at filehandle $fh with
+##       makecall_id $mcid has failed with ASTMGR message parsed in $values
+sub makecall_failed
+{
+    my ($fh) = shift (@_);
+    my ($mcid) = shift (@_);
+    my ($values) = shift (@_);
+    my ($ctinfo);
+
+    if (! defined ($ctinfo = $::Fh_to_clientobj->{$fh}))
+    {
+	##  CT client waiting for this went away, so ingore
+	if ($::Loglevel >= LOG_INFO)
+	{
+	    logit (LOG_INFO,
+		   "CT client " . $fh .
+		   "disappeared for makecall mcid=" .
+		   $mcid)
+	};
+	return;
+    };
+    send_ct_server_msg
+      ($ctinfo,
+       {Satc::MSGTYPE => Satc::MADECALL,
+	Satc::CALLID => 0,
+	Satc::MAKECALL_ID => $mcid,
+	Satc::STATUS => Satc::RESPONSE_FAIL,
+	Satc::MSG => (defined ($values->{"Reason"}) ?
+		  $values->{"Reason"} :
+		  defined ($values->{"Message"}) ?
+		  $values->{"Message"} :
+		  "unknown")});
+};
+
+##  handle_msg_from_vamd ($msg)
+##    -- Handles new message $msg that came in from VAMD
+sub handle_msg_from_vamd
+{
+    my ($data) = shift (@_);
+    my ($event, $callid, $callobj, $agimsg, $bytes, $agifh, @fields);
+    my ($doing_interruptable_satc, $event_matches_stopkeys);
+    my ($agi_doing, $vamd_state, $filename);
+
+    chomp $data;
+    $data =~ s/\r$//;
+
+    ##  Log it
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, "rcv vamd: " . join (",", @fields));
+
+    ##  Parse the request
+    @fields = split (/ /, $data);
+    foreach (@fields)
+    {
+	s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+    };
+
+    ##  Process the message
+    if (! scalar (@fields))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "null message from vamd: \"$data\"");
+	return;
+    };
+    $event = $fields[0];
+    if ((scalar (@fields) == 2) &&
+	(($event eq "m") || ($event eq "h") || ($event eq "t") ||
+	 ($event eq "listening")))
+    {
+	if ($fields[1] !~ /^(\d+)/)
+	{
+	    ($::Loglevel >= LOG_WARN)
+	      && logit (LOG_WARN, "message \"" . $data .
+			"\" from vamd has no valid filename");
+	    return;
+	};
+	$callid = $1;
+	if (! defined ($callobj = $::Callid_to_callobj->{$callid}))
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, "ignoring message \"" . $data .
+			"\" from vamd, no callid matches");
+	    return;
+	};
+	if ($event eq "listening")
+	{
+	    ##  Send monitor AGI command
+	    $agifh = $callobj->{"agifh"};
+	    $callobj->{"vamd_state"} = 2;
+	    $agimsg = {
+		       "msgtype" => AGI_CLIENT_MSG_MONITOR,
+		       "callid" => $callid,
+		      };
+	    $bytes = "EXEC MixMonitor $callid.ul|V(-4)\n";
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, ("callid=[" . $callid . "] snd " .
+				   describe_agi_client_msg ($agimsg) .
+				   " to "  . describe_fh ($agifh)));
+	    send_bytes ($agifh, $bytes);
+	}
+	##  A vamd signal, see if it's one being waited for
+	elsif (($doing_interruptable_satc =
+		defined ($agi_doing = $callobj->{"agi_doing"}) &&
+		(($agi_doing == AGI_CLIENT_MSG_PLAYFILE) ||
+		 ($agi_doing == AGI_CLIENT_MSG_GETDIGIT) ||
+		 ($agi_doing == AGI_CLIENT_MSG_SENDDTMF) ||
+		 ($agi_doing == AGI_CLIENT_MSG_RECORDFILE))) &&
+	       ($event_matches_stopkeys =
+		(index ($callobj->{"stopkeys"}, $event) != -1)))
+	{
+	    ##  Have to interrupt current AGI command
+	    defined ($callobj->{"collected"})
+	      || ($callobj->{"collected"} = "");
+	    $callobj->{"collected"} .= $event;
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG,
+			("callid=[" . $callid . "] queueing vamd event \"" .
+			 $event . "\""));
+
+	    ##  Interrupt current AGI command
+	    stopmedia ($callobj);
+	}
+	##  Queue the event
+	elsif ($event_matches_stopkeys)
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG,
+			("callid=[" . $callid .
+			 "] queueing vamd event \"" .
+			 $event . "\", no current relevant SATC command"));
+	    defined ($callobj->{"collected"})
+	      || ($callobj->{"collected"} = "");
+	    $callobj->{"collected"} .= $event;
+	}
+	##  An undesired vamd signal
+	else
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, ("callid=[" . $callid .
+				   "] ignoring vamd event \"" .
+				   $event . "\", not requested"));
+	};
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "invalid message from vamd: \"$data\"");
+	return;
+    };
+}
+
+##  handle_msg_from_astmgr ($msg)
+##    -- Handles new message $msg
+##       that came in from Asterisk Manager
+sub handle_msg_from_astmgr
+{
+    my ($data) = shift (@_);
+    my ($actionid, $ok, $msg, $values, $field, $fmt);
+    my ($callmaking_spec, $type, $event, $response);
+    my ($ctinfo, $uniqueid, $confid, $received_info, $agifh_info);
+    my ($fh, $agiinfo, $agi_doing, $awaiting_spec, $callobj, $ctfh);
+    my ($agifh, $dialing_callid, $dialstatus);
+
+    ##  Check if this message is one we care about.
+    ##  We care if either the ActionID matches a command we previously sent or
+    ##  it is a message about Meetme or if the Uniqueid is one we care about
+    if ($data =~ /ActionID:\s*([^\r\n]+)\r\n/)
+    {
+	$actionid = $1;
+    };
+    if ($data =~ /Uniqueid:\s*([^\r\n]+)\r\n/)
+    {
+	$uniqueid = $1;
+    };
+    ##  Does it match an actionID we're waiting for
+    ((defined ($actionid) &&
+      defined ($callmaking_spec = $::AstMgrInfo->{"callmaking"}{$actionid})))
+      ||
+	##  Does it match a uniqueid of a channel we're awaiting info on
+	(defined ($uniqueid) &&
+	 (defined ($awaiting_spec = $::AstMgrInfo->{"awaiting"}{$uniqueid}) ||
+	  defined ($dialing_callid = $::AstMgrInfo->{"dialing"}{$uniqueid})))
+	  ||
+	    ##  Is it a MeetMe message
+	    ($data =~ /Event:\s+MeetmeJoin/)
+	      || return;
+
+    ##  Now we can bother to do a full parse
+    if (! (($ok, $msg, $values) = parse_astmgr_msg ($data))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "unparsable data from astmgr: \"$data\"");
+	return;
+    }
+
+    ##  Log it
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	$fmt = "AstMgr msg: ";
+	if (defined ($values))
+	{
+	    foreach $field (keys (%$values))
+	    {
+		$fmt .= " $field=\"" . $values->{"$field"} . "\"";
+	    };
+	};
+	logit (LOG_DBUG, $fmt);
+    };
+
+    ##  If it's a recognized command response,
+    ##  do the appropriate action based on what the astmgr was responding to
+    if (defined ($callmaking_spec))
+    {
+	if ((((defined ($event = $values->{"Event"})) &&    ## Ast 1.2
+	      ($event eq "OriginateFailure"))
+	     ||
+	     ((defined ($event = $values->{"Response"})) && ## Ast 1.2
+	      ($event eq "Error")))
+	    ||
+	    ((defined ($event = $values->{"Event"})) &&    ## Ast 1.4
+	     ($event eq "OriginateResponse") &&
+	     (defined ($response = $values->{"Response"})) &&
+	     ($response eq "Failure")))
+	{
+	    ##  Makecall failure, must tell requester
+	    ##  and remove the fact that we were awaiting a makecall
+	    delete $::AstMgrInfo->{"callmaking"}{$actionid};
+	    makecall_failed ($callmaking_spec->{"ctfh"},
+			     $callmaking_spec->{"mcid"},
+			     $values);
+	}
+	elsif (((defined ($event = $values->{"Event"})) &&  ## Ast 1.2
+		($event eq "OriginateSuccess"))
+	       ||
+	       ((defined ($event = $values->{"Event"})) &&  ## Ast 1.4
+		($event eq "OriginateResponse") &&
+		(defined ($response = $values->{"Response"})) &&
+		($response eq "Success")))
+	{
+	    ##  First stage of makecall succeeded, namely the
+	    ##  channel is being set up and connected on both ends.
+
+	    ##  Remove that we were awaiting a first-stage response
+	    delete $::AstMgrInfo->{"callmaking"}{$actionid};
+	    if (! defined ($ctinfo =
+			   $::Fh_to_clientobj->{$callmaking_spec->{"ctfh"}}))
+	    {
+		##  CT client waiting for this went away, so ingore
+		if ($::Loglevel >= LOG_INFO)
+		{
+		    logit (LOG_INFO,
+			   "CT client " . $callmaking_spec->{"ctfh"} .
+			   "disappeared for makecall mcid=" .
+			   $callmaking_spec->{"mcid"})
+		};
+		return;
+	    };
+
+	    ##  Make sure we got a uniqueid
+	    if (! defined ($uniqueid = $values->{"Uniqueid"}))
+	    {
+		##  Didn't get the critical ID
+		($::Loglevel >= LOG_CRIT)
+		  && logit (LOG_CRIT,
+			    "AstMgr Event \"" .
+			    $event . "\" missing Uniqueid : " .
+			    dump_data($data));
+		send_ct_server_msg
+		  ($ctinfo,
+		   {Satc::MSGTYPE => Satc::MADECALL,
+		    Satc::CALLID => 0,
+		    Satc::MAKECALL_ID => $callmaking_spec->{"mcid"},
+		    Satc::STATUS => Satc::RESPONSE_FAIL,
+		    Satc::MSG => "AstMsr event missing Uniqueid field"});
+		return;
+	    };
+
+	    ##  Now either await the second stage, where the
+	    ##  AGI connection gets made for the call,
+	    ##  or find the call already waiting in "received",
+	    ##  and connect it.
+	    if ((defined ($received_info = $::AstMgrInfo->{"received"})) &&
+		(defined ($agifh_info = $received_info->{$uniqueid})) &&
+		(defined ($agifh = $agifh_info->{"agifh"})) &&
+		(defined ($agiinfo = $::Fh_to_clientobj->{$agifh})))
+	    {
+		##  Already have the AGI call, so connect it
+		if ($::Loglevel >= LOG_INFO)
+		{
+		    logit (LOG_INFO,
+			   "Found awaiting call with uniqueid=" .
+			   $uniqueid .
+			   ", connecting as inbound leg of makecall");
+		};
+		delete $received_info->{$uniqueid};
+		scalar (%$received_info)
+		  || (delete $::AstMgrInfo->{"received"});
+		outgoing_call ($agiinfo, $callmaking_spec);
+	    }
+	    else
+	    {
+		##  Set up "awaiting" record for this successful makecall
+		##  so that when the fastagi connection comes in we know
+		##  where to attach it
+		$::AstMgrInfo->{"awaiting"}{$uniqueid} = $callmaking_spec;
+		if ($::Loglevel >= LOG_INFO)
+		{
+		    logit (LOG_INFO,
+			   "Awaiting new agifh for makecall with uniqueid=" .
+			   $uniqueid);
+		};
+	    };
+	}
+	elsif ((defined ($event = $values->{"Message"})) &&
+	       ($event eq "Originate successfully queued"))
+	{
+	    ##  Makecall still in progress
+	}
+	else
+	{
+	    ($::Loglevel >= LOG_CRIT)
+	      && logit (LOG_CRIT,
+			"unrecognized AstMgr message " .
+			dump_data ($values) . " in response to MakeCall");
+	    return;
+	};
+    }
+    elsif (defined ($awaiting_spec))
+    {
+	if ((defined ($event = $values->{"Event"})) &&
+	    ($event eq "Hangup"))
+	{
+	    ##  Lost the makecall before the AGI connected
+	    delete $::AstMgrInfo->{"awaiting"}{$uniqueid};
+	    makecall_failed ($awaiting_spec->{"ctfh"},
+			     $awaiting_spec->{"mcid"},
+			     $values);
+	};
+    }
+    elsif (defined ($dialing_callid))
+    {
+	if (defined ($dialstatus = $values->{"DialStatus"}))
+	{
+	    $callobj = $::Callid_to_callobj->{$dialing_callid};
+	    if (! defined ($callobj))
+	    {
+		($::Loglevel >= LOG_DBUG)
+		  && logit (LOG_DBUG,
+			    ("callid=[" . $dialing_callid .
+			     "] ignoring DialStatus, call disappeared"));
+	    }
+	    else
+	    {
+		(($ok, $msg, $ctinfo) =
+		 check_result_telephony ($callobj, Satc::TRANSFER,
+					 Satc::TRANSFERED, ))[0] || return;
+		send_ct_server_msg
+		  ($ctinfo, {Satc::MSGTYPE => Satc::TRANSFERED,
+			     Satc::CALLID => $dialing_callid,
+			     Satc::STATUS => Satc::RESPONSE_OK,
+			     Satc::MSG => $dialstatus});
+	    };
+	};
+    }
+    else
+    {
+	##  This must be a Meetme join notification
+	if (! (defined ($event = $values->{"Event"}) &&
+	       defined ($uniqueid = $values->{"Uniqueid"})))
+	{
+	    ##  Missing fields error
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR,
+			"Cannot extract fields Event and Uniqueid " .
+			"from ASTMGR message \"" . $data . "\"");
+	    return;
+	};
+
+	##  See if it's an event regarding a call we know about
+	if (! (defined ($callobj = $::Uniqueid_to_callobj->{$uniqueid})))
+	{
+	    ##  Unknown call
+	    return;
+	};
+
+	##  It's known, so send the result to the CT client
+	##  But watch out: check_result_telephony deletes "agi_doing"
+	$agi_doing = $callobj->{"agi_doing"};
+	(($ok, $msg, $callobj, $ctinfo) =
+	 check_result_telephony
+	 ($callobj, Satc::BRIDGE,
+	  Satc::BRIDGED))[0] || return;
+
+	##  Respond to the MeetmeJoin Success Message.
+	##  The MeetMe call to AGI won't return until the end of
+	##  the conference, so must return success here.
+	$callobj->{"agi_doing"} = $agi_doing;
+	$callobj->{"confOK"} = 1;
+	$ctfh = $callobj->{"ctfh"};
+	if (defined ($ctfh))
+	{
+	    if (! defined ($ctinfo = $::Fh_to_clientobj->{$ctfh}))
+	    {
+		($::Loglevel >= LOG_EROR)
+		  && logit (LOG_EROR,
+			    "handle_msg_from_astmgr() found SATC client fh " .
+			    "\"" . $ctfh . "\"" .
+			    " but no corresponding clientobj");
+		return;
+	    };
+	    send_ct_server_msg
+	      ($ctinfo,
+	       {Satc::MSGTYPE => Satc::BRIDGED,
+		Satc::CALLID => $callobj->{"callid"},
+		Satc::STATUS => Satc::RESPONSE_OK, Satc::MSG => ""});
+	};
+    };
+};
+
+##  call_disconnected ($callid [, $released])
+##    -- Handles call disconnection for $callid,
+##       which will disconnect the call from its SATC client (if any)
+##       and send either a hungup (if ! $released) message to it or
+##       a released message to it.
+sub call_disconnected
+{
+    my ($callid) = shift (@_);
+    my ($released) = shift (@_);
+    my ($callobj, $fh, $ctinfo);
+
+    defined ($released) || ($released = 0);
+    if (! defined ($callobj = $::Callid_to_callobj->{$callid}))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "call_disconnected($callid) called " .
+		   "but no call object found");
+	    return;
+	};
+    };
+    if (defined ($fh = $callobj->{"ctfh"}) &&
+	defined ($ctinfo = $::Fh_to_clientobj->{$fh}))
+    {
+	##  Tell the SATC client that its call has disconnected
+	send_ct_server_msg
+	  ($ctinfo, {Satc::MSGTYPE => ($released ? Satc::RELEASED
+				       : Satc::HUNGUP),
+		     Satc::CALLID => $callid});
+	##  Disconnect the call object from the SATC client object
+	delete $callobj->{"ctfh"};
+	delete $ctinfo->{"callid"}{$callid};
+    };
+};
+
+##  The size of the current file
+$::Current_log_file_size = 0;
+
+sub usage
+{
+    my ($msg) = shift (@_);
+
+    $SIG{__DIE__} = "DEFAULT";
+
+    if (defined ($msg))
+    {
+	die ("phoneglue: " . $msg . "\n");
+    }
+    else
+    {
+	die ("usage: phoneglue [-mgrhost host] [-mgrport port]
+	   [-mgruser user] [-mgrpasswd passwd]
+	   [-asthost host] [-agiport port]
+	   [-vamdhost host] [-vamdport port]
+	   [-ctport port] [-bindhost host] [-U user] [-G group] [-fg]
+	   [-loghost host] [-loglevel level] [-logdir dir]
+
+	-mgrhost is host of the Asterisk manager (default: localhost)
+	-mgrport is the port of the Asterisk manager (default: 5038)
+	-mgruser is the Aterisk manager username (default: phoneglue)
+	-mgrpasswd is the Aterisk manager password (default: phoneglue)
+	-asthost is the asterisk host (default: same as -mgrhost)
+	-agiport is the FastAGI port to listen on (default: 4573)
+	-vamdhost and -vamdport specify how to connect to the vadm
+	-ctport is the SATC port to listen on (default: 44647)
+	-bindhost is the SATC host address to listen on (default: all)
+        -U user is the user to run as, -G group is the group to run as
+        -fg means to run in the forground (normally becomes daemon)
+	-loghost is the dynlog host (optional) to send logs to
+	-loglevel is the loglevel to use, 0-7 (same as syslog)
+	-logdir is the log file directory; - means log to STDOUT\n");
+    };
+};
+
+sub main
+{
+    my ($ok, $msg, $agilisten_fh, $ctlisten_fh, $new_client, @events);
+    my ($fh_spec, $client_fh, $data, $id, $arg, $fh, $os, $line, @lines);
+    my ($callid, $current_time, $timeout);
+    my ($payload, $prefix, @dbdata, @cachestat);
+    my ($table, $row, $field, $value, $msgnum, $msgtext);
+    my ($table_spec, $row_spec, $dblisten_fh, $dbmsg, $datumlist, $datum);
+    my ($match, $input, $pipe_up, $pipe_code, $syntax, $pid, $foreground);
+    my ($pid_dir, $pid_file, $user, $user_id, $group, $group_id, @pwent);
+    my ($received_info, $uniqueid, $received_spec, $agifh, $agiinfo);
+    my Cam::Scom::Event $event;
+    my Cam::Scom $scom = new Cam::Scom;
+
+    ##  Don't let SIGPIPE kill me
+    $::SIG{"PIPE"} = "IGNORE";
+
+    $::Scom = $scom;
+
+    $SIG{__DIE__} = sub { fail ($_[0]) };
+
+    ##  Get command line args
+    while (defined ($arg = shift (@::ARGV)))
+    {
+	if ($arg =~ /^-logl/)
+	{
+	    defined ($::Loglevel = shift (@::ARGV)) || usage();
+	    ($::Loglevel =~ /^\d+$/) || usage();
+	    ($::Loglevel >= 0) && ($::Loglevel <= 7) || usage();
+	}
+	elsif ($arg =~ /^-logh/)
+	{
+	    defined ($::Loghost = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-logd/)
+	{
+	    defined ($::Log_dir = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-agip/)
+	{
+	    defined ($::AGI_port = shift (@::ARGV)) || usage();
+	    ($::AGI_port =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^-mgrpo/)
+	{
+	    defined ($::MGR_port = shift (@::ARGV)) || usage();
+	    ($::MGR_port =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^-vamdh/)
+	{
+	    defined ($::VAMD_host = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-vamdp/)
+	{
+	    defined ($::VAMD_port = shift (@::ARGV)) || usage();
+	    ($::VAMD_port =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^-c/)
+	{
+	    defined ($::CT_port = shift (@::ARGV)) || usage();
+	    ($::CT_port =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^-b/)
+	{
+	    defined ($::CT_host = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-mgrh/)
+	{
+	    defined ($::MGR_host = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-mgru/)
+	{
+	    defined ($::MGR_user = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-mgrpa/)
+	{
+	    defined ($::MGR_passwd = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg eq "-fg")
+	{
+	    $foreground = 1;
+	}
+	elsif ($arg =~ /^-U/)
+	{
+	    defined ($user = shift (@::ARGV)) || usage();
+	    if ($user =~ /^\d+$/)
+	    {
+		$user_id = $user;
+	    }
+	    else
+	    {
+		scalar (@pwent = getpwnam ($user))
+		  || usage ("user \"$user\" unknown");
+		$user_id = $pwent[2];
+	    };
+	}
+	elsif ($arg =~ /^-G/)
+	{
+	    defined ($group = shift (@::ARGV)) || usage();
+	    if ($group =~ /^\d+$/)
+	    {
+		$group_id = $group;
+	    }
+	    else
+	    {
+		scalar (@pwent = getgrnam ($group))
+		  || usage ("group \"$group\" unknown");
+		$group_id = $pwent[2];
+	    };
+	}
+	else
+	{
+	    usage();
+	};
+    };
+
+    ##  Verify existence and ownership of log directory
+    if ($::Log_dir eq "-")
+    {
+	$::Logfile = "-";
+	$::Log_dir = "/var/tmp/phoneglue";
+    }
+    else
+    {
+	$::Logfile = join ("/", $::Log_dir, "phoneglue.log");
+    };
+
+    (-e $::Log_dir)
+      && (! (-d $::Log_dir))
+	&& system ("rm", "-r", "-f", $::Log_dir);
+    (-d $::Log_dir)
+      || mkdir ($::Log_dir)
+	|| usage ("Cannot mkdir log directory $::Log_dir: $!");
+    scalar (@pwent = stat ($::Log_dir))
+      || usage ("Cannot stat log directory $::Log_dir: $!");
+    if ((defined ($user_id) && ($pwent[4] != $user_id)) ||
+	(defined ($group_id) && ($pwent[5] != $group_id)))
+    {
+	chown ($user_id, $group_id, $::Log_dir)
+	  || usage ("Cannot chown log directory $::Log_dir: $!");
+    };
+
+    ##  Open the log file
+    openlogfile (1);
+
+    ##  Increase descriptors
+    (($ok, $msg, $_) = &increase_descriptors())[0]
+      || usage ("Cannot increase descriptors with setrlimit(): $msg");
+
+    ##  Fork daemon
+    if (! defined ($foreground))
+    {
+	##  Verify existence of PID directory
+	$pid_dir = "/var/run/phoneglue";
+	$pid_file = join ("/", $pid_dir, "phoneglue.pid");
+	(-e $pid_dir)
+	  && (! (-d $pid_dir))
+	    && system ("rm", "-r", "-f", $pid_dir);
+	(-d $pid_dir)
+	  || mkdir ($pid_dir)
+	    || die ("Cannot mkdir pid directory $pid_dir: $!\n");
+	open (::FH, ">$pid_file")
+	  && (print ::FH ("\n"))
+	    && close (::FH)
+	      || die ("Cannot write pid file $pid_file: $!\n");
+
+	POSIX::setsid();
+	chdir ($::Log_dir)
+	  || usage ("Cannot cd to log directory $::Log_dir: $!");
+	close (STDIN);
+	open (STDOUT, ">phoneglue.log")
+	  || usage ("Cannot open STDOUT to phoneglue.log for write: $!");
+	open (STDERR, ">&STDOUT")
+	  || usage ("Cannot open STDERR dup to STDOUT: $!");
+	defined ($pid = fork())
+	  || usage ("Cannot fork: $!");
+	if ($pid)
+	{
+	    ##  Write the pidfile
+	    open (::FH, ">$pid_file")
+	      && (print ::FH ("$pid\n"))
+		&& close (::FH)
+		  || die ("Cannot write pid file $pid_file: $!\n");
+	    exit;
+	};
+    };
+
+    ##  Step down from root
+    if (defined ($group_id))
+    {
+	($), $() = ($group_id, $group_id);
+    };
+    if (defined ($user_id))
+    {
+	($>, $<) = ($user_id, $user_id);
+    };
+
+    ##  Try to connect to the log host
+    (defined ($::Loghost)) && opendynlog();
+    log_new_day();
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "phoneglue started");
+    };
+
+    ##  Determine all protocols available
+    @::CT_Protocols = ();
+    push (@::CT_Protocols, new Satc);
+    $SIG{__DIE__} = "DEFAULT";
+    eval {require Ript; import Ript;};  ##  Optionally available
+    $SIG{__DIE__} = sub { fail ($_[0]) };
+    if (! length ($@))
+    {
+	push (@::CT_Protocols, new Ript);
+	if ($::Loglevel >= LOG_NOTI)
+	{
+	    logit (LOG_NOTI, "RIPT protocol supported");
+	};
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_NOTI)
+	{
+	    logit (LOG_NOTI, "RIPT protocol not supported");
+	};
+    };
+
+    ##  Connect to VAMD if possible
+    $::VAMDInfo = {"type" => FHINFO_TYPE_VAMD,
+		   "fh" => $::VAMDFh,
+		   "host" => $::VAMD_host};
+    $::Fh_to_clientobj->{$::VAMDFh} = $::VAMDInfo;
+    if ((($ok, $msg) =
+	 $scom->connect ($::VAMDFh, $::VAMD_host, $::VAMD_port,
+			 ".", 0))[0])
+    {
+	$::VAMD_Available = 1;
+	($::Loglevel >= LOG_NOTI) && logit (LOG_NOTI, "VAMD available");
+    }
+    else
+    {
+	$::VAMD_Available = 0;
+	($::Loglevel >= LOG_NOTI) && logit (LOG_NOTI, "VAMD not available");
+    };
+
+    ##  Log in to the asterisk manager
+    $::AstMgrInfo = {"type" => FHINFO_TYPE_ASTMANAGER,
+		     "fh" => $::AstMgrFh,
+		     "host" => $::MGR_host,
+		     "callmaking" => {},
+		     "awaiting" => {},
+		     "redirecting" => {}};
+    $::Fh_to_clientobj->{$::AstMgrFh} = $::AstMgrInfo;
+    (($ok, $msg) =
+	$scom->connect ($::AstMgrFh, $::MGR_host, $::MGR_port,
+			".:\r\n\r\n", 0))[0]
+	  || fail ("Cannot connect to Asterisk Manager: $msg");
+    $scom->write ($::AstMgrFh, join ("\r\n",
+				     "Action: login",
+				     "Username: $::MGR_user",
+				     "Secret: $::MGR_passwd")
+		  . "\r\n\r\n");
+    ($match, $input, $pipe_up, $pipe_code, $syntax) =
+      $scom->expect ($::AstMgrFh, "/Authentication accepted/", 5);
+    $pipe_up || fail ("Asterisk Manager disconnected with code $pipe_code");
+    $syntax && fail ("Internal regex error: $syntax");
+    $match || fail ("Cannot login to Asterisk Manager: $input");
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "Logged into Asterisk Manager")
+    };
+
+    ##  Establish the asterisk socket listener
+    $agilisten_fh = "::ASTAGI";
+    $::Fh_to_clientobj->{$agilisten_fh} = {"type" => FHINFO_TYPE_AGI_LISTENER,
+					   "fh" => $agilisten_fh,
+					   "host" => "localhost"};
+    (($ok, $msg) =
+     $scom->listen ($agilisten_fh, $::AGI_port, "::FASTAGI"))[0]
+      || fail ("Cannot establish AGI socket listener: $msg");
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "Listening for FastAGI connections on port "
+	       . $::AGI_port)
+    };
+
+    ##  Establish the CT client socket listener
+    $ctlisten_fh = "::CTLISTENER";
+    $::Fh_to_clientobj->{$ctlisten_fh} = {"type" => FHINFO_TYPE_CT_LISTENER,
+					  "fh" => $ctlisten_fh,
+					  "host" => "localhost"};
+    (($ok, $msg) = $scom->listen
+     ($ctlisten_fh, $::CT_port, "::CTCLIENT", $::CT_host))[0]
+      || fail ("Cannot establish CT client socket listener: $msg");
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "Listening for SATC client connections on port "
+	       . $::CT_port)
+    };
+
+    while (1)
+    {
+	##  Start out assuming no timeout necessary
+	$current_time = time;
+	$timeout = -1;
+
+	##  If log server is disconnected, set a timeout
+	if (defined ($::Loghost) &&
+	    $::Time_of_next_connect_to_log_server && ($timeout == -1))
+	{
+	    $timeout = $::Time_of_next_connect_to_log_server - $current_time;
+	    ($timeout < 0) && ($timeout = 0);
+	};
+
+	##  If we have received inbound calls that are awaiting
+	##  disposition because of being potential inbound legs of makecalls,
+	##  wake up every 2 seconds.
+	if (defined ($received_info = $::AstMgrInfo->{"received"}))
+	{
+	    (($timeout == -1) || ($timeout > 2)) && ($timeout = 2);
+	};
+
+	##  Want to wake up once every 10 minutes to see if
+	##  the day has rolled over
+	($timeout == -1) && ($timeout = 600);
+
+	@events = $scom->getevents ($timeout);
+	while (defined ($datumlist = shift (@events)))
+	{
+	    $fh = shift (@$datumlist);
+	    while (defined ($datum = shift (@$datumlist)))
+	    {
+		if ($fh eq $agilisten_fh)
+		{
+		    ##  Got an event on the asterisk AGI port listener
+		    $event = $datum;
+		    if ($event->{end})
+		    {
+			fh_stopped ($fh, "port stopped, code " .
+				    $event->{term});
+		    }
+		    else
+		    {
+			##  Got a new connection, register it
+			$new_client = $event->{port};
+			if ($::Loglevel >= LOG_INFO)
+			{
+			    logit (LOG_INFO, "New AGI connection on fh = " .
+				   $new_client);
+			};
+
+			##  Don't know callid yet - could be an
+			##  already established call that got
+			##  a REDIRECT via the manager
+			$::Fh_to_clientobj->{$new_client} =
+			{"type" => FHINFO_TYPE_AGI_CLIENT,
+			 "fh" => $new_client,
+			 "host" =>
+			 four_byte_to_dot_separated ($event->{addr})};
+			(($ok, $msg) = $scom->register ("$new_client+"))[0]
+			  || fail ($msg);
+		    };
+		}
+		elsif ($fh eq $ctlisten_fh)
+		{
+		    ##  Got an event on the CT client port listener
+		    $event = $datum;
+		    if ($event->{end})
+		    {
+			fh_stopped ($fh, "port stopped, code " .
+				    $event->{term});
+		    }
+		    else
+		    {
+			##  Got a new connection, register it
+			$new_client = $event->{port};
+			if ($::Loglevel >= LOG_INFO)
+			{
+			    logit (LOG_INFO, "New CT connection on fh = " .
+				   $new_client);
+			};
+			$::Fh_to_clientobj->{$new_client} =
+			{"type" => FHINFO_TYPE_CT_CLIENT,
+			 "fh" => $new_client,
+			 "host" => four_byte_to_dot_separated($event->{addr}),
+			 "register" => {},
+			 "callid" => {}};
+			(($ok, $msg) = $scom->register ("$new_client+.:"))[0]
+			  || fail ($msg);
+			$::Ct_Client_Fhs->{$new_client} = 1;
+		    };
+		}
+		elsif ($fh eq $::AstMgrFh)
+		{
+		    ##  Got an event on the Asterisk Manager connection
+		    if (ref ($datum))
+		    {
+			##  Disconnected
+			$event = $datum;
+			fh_stopped ($fh, "disconnected, code " .
+				    $event->{term});
+		    }
+		    else
+		    {
+			##  Message from Asterisk Manager
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG, "rcv mgr(" . $fh .
+				   "): " . dump_data ($datum));
+			};
+			handle_msg_from_astmgr ($datum);
+		    };
+		}
+		elsif ($fh eq $::VAMDFh)
+		{
+		    ##  Got an event on the VAMD connection
+		    if (ref ($datum))
+		    {
+			##  Disconnected
+			$event = $datum;
+			fh_stopped ($fh, "disconnected, code " .
+				    $event->{term});
+		    }
+		    else
+		    {
+			##  Message from VAMD
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG, "rcv vamd(" . $fh .
+				   "): " . dump_data ($datum));
+			};
+			handle_msg_from_vamd ($datum);
+		    };
+		}
+		elsif ($fh eq $::Log_fh)
+		{
+		    ##  Got an event on the dynlog handle
+		    if (ref ($datum))
+		    {
+			##  Dynlog disconnected
+			$event = $datum;
+			logtofile (LOG_INFO,
+				   "dynlog server disconnected, code " .
+				   $event->{term});
+			$::Scom->unregister ($::Log_fh);
+			$::Time_of_next_connect_to_log_server =
+			  time +
+			    $::Interval_between_log_server_connect_attempts;
+		    }
+		    else
+		    {
+			##  Dynlog message - only one I recognize is
+			##  change in loglevel
+			foreach $input (split (//, $datum))
+			{
+			    $input = ord ($input);
+			    if (($input >= LOG_EMRG) && ($input <= LOG_DBUG))
+			    {
+				$::Loglevel = $input;
+			    };
+			};
+		    };
+		}
+		elsif (defined ($fh_spec = $::Fh_to_clientobj->{$fh}))
+		{
+		    ##  Got an event from one of my clients
+		    if (ref ($datum))
+		    {
+			##  A client disconnected
+			$event = $datum;
+			fh_stopped ($fh, "disconnected code " .
+				    $event->{term});
+		    }
+		    elsif ($fh_spec->{"type"} == FHINFO_TYPE_AGI_CLIENT)
+		    {
+			##  Message from asterisk AGI client
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG, "rcv agi(" . $fh .
+				   "): " . dump_data ($datum));
+			};
+			handle_msg_from_agi_client ($fh_spec, $datum);
+		    }
+		    elsif ($fh_spec->{"type"} == FHINFO_TYPE_CT_CLIENT)
+		    {
+			##  Message from CT client
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG, "rcv ct(" . $fh .
+				   "): " . dump_data ($datum));
+			};
+			handle_bytes_from_ct_client ($fh_spec, $datum);
+		    }
+		    else
+		    {
+			##  WTF?  We just got a message on a filehandle
+			##  that wasn't of an excpected client type
+			if ($::Loglevel >= LOG_EROR)
+			{
+			    logit (LOG_EROR, "rcv from UNEXPECTED " .
+				   $::Fhinfo_type_description
+				   [$fh_spec->{"type"}] . "\"" . $fh .
+				   "\": \"" . $datum . "\"");
+			};
+		    };
+		}
+		else
+		{
+		    ##  WTF?  We just got a message on an unknown filehandle
+		    ##  This can happen if it gets unregistered on EOF, then
+		    ##  we get the queued termination event.
+		    if ($::Loglevel >= LOG_DBUG)
+		    {
+			logit (LOG_DBUG,
+			       "rcv from UNKNOWN FILEHANDLE \"$fh\": \""
+			       . $datum . "\"");
+		    };
+		};
+	    };
+	};
+
+	$current_time = time;
+
+	##  Check for timed out received calls
+	if (defined ($received_info = $::AstMgrInfo->{"received"}))
+	{
+	    foreach $uniqueid (keys (%$received_info))
+	    {
+		$received_spec = $received_info->{$uniqueid};
+		if ($received_spec->{"when"} + 2 < $current_time)
+		{
+		    $agifh = $received_spec->{"agifh"};
+		    if (defined ($agiinfo = $::Fh_to_clientobj->{$agifh}))
+		    {
+			($::Loglevel >= LOG_INFO)
+			  && logit (LOG_INFO,
+				    "new agi call with uniqueid=" . $uniqueid .
+				    " timed out waiting for inbound leg" .
+				    " of makecall, making it new inbound.");
+			incoming_call ($agiinfo);
+		    };
+		    delete $received_info->{$uniqueid};
+		};
+	    }
+	    if (scalar (keys (%$received_info)) == 0)
+	    {
+		delete $::AstMgrInfo->{"received"};
+	    };
+	};
+
+	##  Check for day rollover
+	if ((! defined ($::Last_day)) ||
+	    ($::Last_day != (localtime)[7]))
+	{
+	    log_new_day();
+	};
+
+	if ($::Time_of_next_connect_to_log_server &&
+	    ($::Time_of_next_connect_to_log_server <= $current_time))
+	{
+	    ##  Time for another log server connection attempt
+	    &opendynlog();
+	};
+    };
+};
+
+main();
+
+=head1 AUTHOR
+
+Doug Campbell, C<< <soup at ampersand.com> >>
+
+=head1 SUPPORT
+
+You can find documentation for this module with the perldoc command.
+
+    perldoc phoneglue
+
+=head1 COPYRIGHT & LICENSE
+
+Copyright 2006 Doug Campbell, all rights reserved.
+
+This program is released under the following license: GPL
+
+=cut

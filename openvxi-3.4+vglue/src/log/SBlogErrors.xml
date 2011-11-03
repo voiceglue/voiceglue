@@ -1,0 +1,105 @@
+<?xml version="1.0"?>
+
+<!--
+Vocalocity OpenVXI
+Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered trademarks of Vocalocity, Inc. 
+OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.
+-->
+
+<ErrorMessages moduleName="*SBlog">
+    <error num="100" severity="1">SBlog: Out of memory </error>
+    <error num="101" severity="1">SBlog: Mutex create failed </error>
+    <error num="102" severity="1">SBlog: Mutex lock failed </error>
+    <error num="103" severity="1">SBlog: Mutex unlock failed </error>
+    <error num="104" severity="1">SBlog: Already initialized </error>
+    <error num="105" severity="1">SBlog: Not initialized </error>
+
+    <error num="150" severity="1">SBlogListeners: Invalid system log
+    file format configured </error>
+    <error num="151" severity="1">SBlogListeners: System log file open
+    failed </error> 
+    <error num="152" severity="1">SBlogListeners: Invalid system log
+    file size limit configured </error>
+    <error num="153" severity="1">SBlogListeners: Invalid content
+    logging file size limit configured </error>
+    <error num="154" severity="1">SBlogListeners: Invalid system log
+    file name configured </error>
+
+    <error num="200" severity="2">SBlog: Internal error in
+    RegisterErrorListener(), NULL callback data </error>
+    <error num="201" severity="2">SBlog: Internal error in
+    UnregisterErrorListener(), NULL callback data </error>
+    <error num="202" severity="2">SBlog: Internal error in
+    RegisterDiagnosticListener(), NULL callback data </error>
+    <error num="203" severity="2">SBlog: Internal error in
+    UnregisterDiagnosticListener(), NULL callback data </error>
+    <error num="204" severity="2">SBlog: Internal error in
+    RegisterEventListener(), NULL callback data </error>
+    <error num="205" severity="2">SBlog: Internal error in
+    UnregisterEventListener(), NULL callback data </error>
+    <error num="206" severity="2">SBlog: Internal error in
+    RegisterContentListener(), NULL callback data </error>
+    <error num="207" severity="2">SBlog: Internal error in
+    RegisterContentListener(), NULL callback data </error>
+    <error num="208" severity="2">SBlog: Internal error in
+    ParseKeyValue(), invalid argument </error>
+
+    <error num="250" severity="2">SBlogListeners: System log file
+    write failed </error>
+    <error num="251" severity="2">SBlogListeners: System log file
+    rollover failed </error>
+    <error num="252" severity="2">SBlogListeners: Content logging file
+    open failed </error> 
+    <error num="253" severity="2">SBlogListeners: Content logging file
+    write failed </error> 
+    <error num="254" severity="2">SBlogListeners: Invalid argument to
+    API function </error>
+
+    <error num="300" severity="3">SBlog: Tag ID is too large </error>
+    <error num="301" severity="3">SBlog: Invalid format string for
+    VXIlog API call, replacements for key names must be %s </error>
+    <error num="302" severity="3">SBlog: Invalid format string for
+    VXIlog API call, missing value for a key </error>
+    <error num="303" severity="3">SBlog: Invalid format string for
+    VXIlog API call, must be a list of format strings for key/value
+    pairs </error>
+    <error num="304" severity="3">SBlog: Internal error, parse failure
+    after key/value insertions </error>
+    <error num="305" severity="3">SBlog: Empty module name passed to
+    VXIlog API call </error>
+    <error num="306" severity="3">SBlog: Invalid argument to
+    VXIlog::ContentOpen() </error>
+    <error num="307" severity="3">SBlog: Invalid argument to
+    VXIlog::ContentClose() </error>
+    <error num="308" severity="3">SBlog: Invalid argument to
+    VXIlog::ContentWrite() </error>
+    <error num="309" severity="3">SBlog: SBlogCreateResource()
+    requires a non-NULL log interface pointer </error>
+    <error num="310" severity="3">SBlog: SBlogDestroyResource()
+    requires a non-NULL log interface pointer </error>
+
+    <error num="350" severity="3">SBlogListeners: XML error text
+    lookup feature disabled because the listener is compiled without
+    defining HAVE_XERCES </error>
+    <error num="351" severity="3">SBlogListeners: XML error text
+    lookup feature disabled due to an error in parsing the configured
+    XML error files </error>
+    <error num="352" severity="3">SBlogListeners: XML error lookup
+    file parse failed </error>
+    <error num="353" severity="3">SBlogListeners: XML parser
+    exception </error>
+</ErrorMessages>

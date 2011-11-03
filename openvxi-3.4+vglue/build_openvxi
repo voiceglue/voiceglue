@@ -1,0 +1,96 @@
+#!/usr/bin/perl -- -*-CPerl-*-
+
+##  Builds openvxi+vglue for voiceglue
+
+use strict;
+
+sub fix_libmozjs
+{
+    my ($xulpkg, $xullibdir, $xullibfile, $destination, @components);
+    $xulpkg = "libxul";
+    chomp ($xullibdir = `pkg-config --variable=libdir $xulpkg`);
+    $xullibfile = join ("/", $xullibdir, "libmozjs.so");
+    @components = split (/\//, $xullibdir);
+    pop (@components);
+    $destination = join ("/", @components) . "/" . "libmozjs.so";
+    if ((-e $xullibfile) && (! -e $destination))
+    {
+	system ("ln", "-s", $xullibfile, $destination);
+    };
+};
+
+sub main
+{
+    ##  Read params
+    $::Family = shift (@::ARGV);
+    # $::Release = shift (@::ARGV);
+    # $::Major = shift (@::ARGV);
+    # $::Minor = shift (@::ARGV);
+    # $::Arch = shift (@::ARGV);
+
+    ##  Some systems require a fix to libmozjs location
+    fix_libmozjs();
+
+    ##  Set environment variables for openvxi compilation
+    chomp ($::ENV{"SWISBSDK"} = `pwd`);
+    $::ENV{"XERCESDIR"} = "/usr";
+    $::ENV{"SPIDERMONKEYDIR"} = "/usr";
+    $::ENV{"SYSTYPE"} = $::Family;
+
+    ##  Compile each component
+    chdir ("src") || die ("Cannot cd to src: $!");
+
+    chdir ("VXIinterfaces") || die ("Cannot cd to VXIinterfaces: $!");
+    system ("make", "clean");
+    system ("make", "all") && die ("Build failed in VXIinterfaces");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("swichar") || die ("Cannot cd to swichar: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in swichar");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("value") || die ("Cannot cd to value: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in value");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("trd") || die ("Cannot cd to trd: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in trd");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("log") || die ("Cannot cd to log: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in log");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("cache") || die ("Cannot cd to cache: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in cache");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("inet") || die ("Cannot cd to inet: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in inet");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("jsi") || die ("Cannot cd to jsi: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in jsi");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("VXI") || die ("Cannot cd to VXI: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in VXI");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("VXIclient") || die ("Cannot cd to VXIclient: $!");
+    system ("make", "clean");
+    system ("make", "all-shared") && die ("Build failed in VXIclient");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("..") || die ("Cannot cd to ..: $!");
+}
+
+main();

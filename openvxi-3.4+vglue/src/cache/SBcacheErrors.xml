@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+
+<!--
+Vocalocity OpenVXI
+Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered trademarks of Vocalocity, Inc. 
+OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.
+-->
+
+<ErrorMessages moduleName="*SBcache">
+    <error num="100" severity="1">SBcache: Out of memory </error>
+    <error num="101" severity="1">SBcache: Initialized twice </error>
+    <error num="102" severity="1">SBcache: No cache directory
+    configured </error>
+    <error num="103" severity="1">SBcache: Invalid cache directory
+    name, must be ASCII characters </error>
+    <error num="104" severity="1">SBcache: Invalid cache total size
+    configured </error>
+    <error num="105" severity="1">SBcache: Invalid cache entry size
+    limit configured </error>
+    <error num="106" severity="1">SBcache: Invalid cache entry
+    expiration time (in seconds) </error>
+    <error num="107" severity="1">SBcache: Cache entry size limit must
+    not exceed the cache total size limit </error>
+    <error num="108" severity="1">SBcache: Invalid argument for
+    SBcacheCreateResource( ) </error>
+    <error num="109" severity="1">SBcache: Mutex create failed </error>
+    <error num="110" severity="1">SBcache: Mutex lock failed </error>
+    <error num="111" severity="1">SBcache: Mutex unlock failed </error>
+    <error num="112" severity="1">SBcache: Internal error, cache
+    manager already created </error>
+    <error num="113" severity="1">SBcache: Configured cache directory
+    is not a directory, it is a file </error>
+    <error num="114" severity="1">SBcache: Could not create the cache
+    directory </error>
+
+    <error num="200" severity="2">SBcache: Invalid argument for Open( )
+    or OpenEx( ) </error>
+    <error num="201" severity="2">SBcache: Invalid argument for 
+    Close( ) or CloseEx( ) </error>
+    <error num="202" severity="2">SBcache: Invalid argument for
+    Unlock( ) or UnlockEx( ) </error>
+    <error num="203" severity="2">SBcache: Invalid argument for
+    Read( ) </error>
+    <error num="204" severity="2">SBcache: Invalid argument for
+    Write( ) </error>
+    <error num="205" severity="2">SBcache: Cache already shut down </error>
+    <error num="206" severity="2">SBcache: Read failed, attempted to
+    read from a stream opened for writing </error>
+    <error num="207" severity="2">SBcache: Internal error, Read failed
+    due to file not open </error>
+    <error num="208" severity="2">SBcache: Read failed due to an I/O
+    error </error>
+    <error num="209" severity="2">SBcache: Write failed, attempted to
+    write to a stream opened for reading </error>
+    <error num="210" severity="2">SBcache: Internal error, Write
+    failed due to file not open </error>
+    <error num="211" severity="2">SBcache: Internal error, invalid
+    cache entry mode for close </error>
+    <error num="212" severity="2">SBcache: Write failed due to an I/O
+    error </error>
+    <error num="213" severity="2">SBcache: File open for writing a cache
+    entry failed </error>
+    <error num="214" severity="2">SBcache: File open for reading a cache
+    entry failed </error>
+    <error num="215" severity="2">SBcache: Internal error, invalid
+    cache entry open mode </error>
+    <error num="216" severity="2">SBcache: Deletion of a cache entry
+    failed </error>
+
+    <error num="300" severity="3">SBcache: File close failed </error>
+    <error num="301" severity="3">SBcache: Invalid CACHE_CREATION_COST
+    value type, VXIInteger required </error>
+
+</ErrorMessages>

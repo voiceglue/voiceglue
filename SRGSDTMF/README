@@ -1,0 +1,29 @@
+SRGSDTMF
+
+A partial SRGS DTMF parser.
+
+INSTALLATION
+
+To install this module, run the following commands:
+
+    perl Build.PL
+    ./Build
+    ./Build test
+    ./Build install
+
+
+SUPPORT AND DOCUMENTATION
+
+After installing, you can find documentation for this module with the perldoc command.
+
+    perldoc SRGSDTMF
+
+You can also look for information at:
+
+        http://voiceglue.org
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2007 Doug Campbell
+
+This program is released under the following license: gpl

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+RUNDIR=/var/lib/openvxi-3.4
+mkdir -v -p $RUNDIR
+(cd lib; ls -1 . > $RUNDIR/lib_manifest)
+(cd include; ls -1 . > $RUNDIR/inc_manifest)
+cp -v lib/* /usr/lib
+if [ -d /usr/lib64 ] ; then
+    cp -v lib/* /usr/lib64
+fi
+cp -v include/* /usr/include
+cp -v -u -r -p config $RUNDIR
+cp -v -u -r -p schema $RUNDIR
+chmod -R a+r $RUNDIR
+chmod -R a+w $RUNDIR

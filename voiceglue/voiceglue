@@ -1,0 +1,6685 @@
+#!/usr/bin/perl --             -*-CPerl-*-
+
+#############################################################
+##  Copyright 2006-2011 Ampersand Inc., Doug Campbell
+##
+##  This is the voiceglue program.
+##
+##  Voiceglue is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  Voiceglue is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with Voiceglue; if not, see <http://www.gnu.org/licenses/>.
+
+#############################################################
+##  voiceglue: An OpenVXI (VXML) <-> SATC translator.
+##    VMXL is a telephony control markup language and is implemented without
+##    telephony support by the open source, GPL'd OpenVXI project.
+##    SATC is Simple ASCII Telephony Control, a protocol
+##    that provides call control and media control of multiple
+##    telephone calls simultaneously, both inbound and outbound.
+##    Astvxml implements OpenVXI telephony using SATC telephony client calls.
+##    The voiceglue daemon, when started, first opens a connection
+##    to a SATC server at port 44647 (thus becoming a SATC client).
+##    It registers to receive SATC "incoming" messages
+##    (corresponding to incomuing calls).
+##    When incoming calls are signalled by SATC, voiceglue
+##    runs the openVXI VXML engine on the call.
+##    Telephony requests made by OpenVXI are translated
+##    to SATC messages and forwarded to the SATC server.
+##
+#############################################################
+
+use Config;
+use Carp;
+use Sys::Hostname qw(hostname);
+use Socket;
+use CGI qw(-utf8);
+use File::Path;
+use POSIX ":sys_wait_h";
+use Time::HiRes qw(gettimeofday);
+use List::Util;
+use BSD::Resource;
+use URI::Escape;
+use XML::LibXML;
+use Cam::Scom;
+use Cam::Scom::Event;
+use Satc;
+use Voiceglue::Conf;
+use SRGSDTMF;
+use Vxglue;
+
+use bytes;
+use strict;
+
+#################################################################
+##  Tunables (times are all in seconds)
+$::Retry_seconds_for_audio_fetch_failures = 60;
+$::Default_httpcache_fetch_timeout = 7;
+$::Default_httpcache_maxage = 60 * 120;
+$::Cache_purge_interval = 30;
+$::Cache_purge_unused_time = 60 * 10;
+$::Cache_purge_uncacheable_unused_time = 10;
+$::Blind_transfer_method = "dial";
+$::Cmd_host = "localhost";
+$::Cmd_port = 44987;
+$::Trace_cache = 0;
+
+#################################################################
+##  Audio content type maps
+$::File_extention_to_content_type =
+{
+ "ulaw" => "audio/basic",		## ulaw
+ "au" => "audio/basic",			## ulaw
+ "pcm" => "audio/basic",		## ulaw
+ "ul" => "audio/basic",			## ulaw
+ "mu" => "audio/basic",			## ulaw
+ "alaw" => "audio/x-alaw-basic",	## alaw
+ "al" => "audio/x-alaw-basic",		## alaw
+ "wav" => "audio/x-wav",		## slin
+ "mp3" => "audio/mpeg",			## mp3
+ "gsm" => "audio/x-gsm",		## gsm
+};
+
+$::Content_type_to_file_extension =
+{
+ "audio/basic" => "ulaw",		## ulaw
+ "audio/x-alaw-basic" => "alaw",	## alaw
+ "audio/x-wav" => "wav",		## slin
+ "audio/mpeg" => "mp3",			## mp3
+ "audio/x-gsm" => "gsm",		## gsm
+};
+
+
+#################################################################
+##  Logging setup
+$::Logging_enabled = 0;      ##  Set to 1 when logging established
+$::Log_dir = "/var/log/voiceglue";
+$::Log_fh = "::LOG";
+$::Loglevel = 7;
+$::Max_log_file_size = 100000000;
+$::Number_of_previous_kept = 2;
+$::Time_of_next_connect_to_log_server = time;   ##  If non-0, failed to connect
+$::Interval_between_log_server_connect_attempts = 120;
+$::Dynlog_Mythread = sprintf ("%-8.8s", hostname() ."--------");
+$::Dynlog_Mymodule = "VOICEGLU";
+$::Dynlog_VXImodule = "OPEN_VXI";
+@::Msg_level_strings =
+  ("EMRG", "ALRT", "CRIT", "EROR", "WARN", "NOTI", "INFO", "DBUG");
+use constant LOG_EMRG => 0;
+use constant LOG_ALRT => 1;
+use constant LOG_CRIT => 2;
+use constant LOG_EROR => 3;
+use constant LOG_WARN => 4;
+use constant LOG_NOTI => 5;
+use constant LOG_INFO => 6;
+use constant LOG_DBUG => 7;
+
+use constant VXIrec_RESULT_SUCCESS => 0;
+use constant VXIrec_RESULT_FAILURE => 1;
+
+#################################################################
+##  Globals
+$::Stop_requested = 0;	     ##  1 means process stop requested
+$::Finished = 0;             ##  1 means done with main loop
+$::VXML_threads = 0;         ##  How many current VXML threads
+$::CmdFh = "::CMDLISTEN";    ##  Filehandle for the command listener
+$::CmdInfo = undef;          ##  Shortcut to Clients->{$::CmdFh}
+$::CTSrvFh = "::CTSRV";      ##  Filehandle for the CT Server
+$::CTSrvInfo = undef;        ##  Shortcut to Clients->{$::CTSrvFh}
+$::SSML_Passthrough = 0;     ##  Whether to pass full SSML tags to TTS
+$::Ignore_Inputmode_Errors = 0;	##  Whether to ignore inputmode errors
+$::Default_vxml = "";	     ##  URL of default vxml page to load
+$::Valgrind = 0;
+
+$::Clients = {};
+##  Maps client fh's to:
+##    ->{"type"}           -- one of the FHINFO_TYPE_* below
+##    ->{"fh"}             -- filehandle
+##    ->{"host"}           -- remote host
+##   VXML_INTERP specific:
+##    ->{"callid"}         -- if defined, the phoneglue callID handling
+##    ->{"url"}		   -- the URL used to fetch the first VXML page
+##    ->{"url_hangup_field"} -- if length > 0, hangup field in URL
+##    ->{"call_handle"}    -- the handle provided by the VXML interpreter
+##    ->{"vxml_fd"}        -- IPC file descriptor used by VXML interpreter
+##    ->{"connected"}      -- if defined, the call is connected (not hungup)
+##    ->{"processing"}     -- 0 until first message from VXML interp received
+##    ->{"cookie_file"}	   -- if defined, path to cookie jar file
+##    ->{"satc_doing"}     -- if defined, contains the command the
+##                            SATC server is running for this call
+##    ->{"vxml_doing"}     -- if defined, contains the command the
+##                            VXML interpreter is running for this call
+##    ->{"gram_ids"}{<gram_id>}{"active"}  -- 1 = active 0 o.w.
+##                             {"rule"}    -- the compiled rule
+##    ->{"gram_texts"}{<gram_text>}{<gram_id>} -- 1 = gram text has gram_id
+##    ->{"gram_signals"}   -- if defined, the list of currently active grammar
+##                            signal characters to request
+##    ->{"play_queued"}    -- if defined, contains the next prompts to play
+##                            in the form of a promptspec:
+##        [<index>]{"status"}       -- -1 = failed creation
+##                                      0 = awaiting httpcache creation
+##                                      1 = ready to play
+##                                      2 = played
+##                 {"type"}         -- "audio" or "dtmf"
+##                 {"request_id"}   -- http cache request id for this item
+##                 {"bargein"}      -- 0 = no bargein, 1 = bargein
+##                 {"path"}         -- file path to give SATC server or DTMFs
+##    ->{"play_requested"} -- if defined, VXML requested a play of prompts
+##                            that has not yet completed (due to a wait,
+##                            recognize, or record being sent)
+##    ->{"wait_requested"} -- if defined, VXML requested a wait 'till play done
+##    ->{"recognize_requested"}  -- if defined, VXML requested a recognition
+##                                  that has not yet completed.
+##    ->{"record_requested"}  -- if defined, VXML requested a record
+##                               that has not yet completed.
+##    ->{"transfer_requested"}  -- if defined, the URL of a VXML requested
+##                                 transfer that has not yet completed.
+##    ->{"xfer_type"}	   -- the type of transfer, "blind" or "bridged"
+##    ->{"xfer_from"}	   -- what to set the ANI to (callerid) on transfer
+##    ->{"xfer_timeout"}   -- max ms to timeout after (0 = no timeout)
+##    ->{"got_dtmf"}       -- if defined, DTMF keys that have been received
+##                            (may be "" if termchar first char received)
+##    ->{"rec_timeout"}    -- recognition/record initial silence timeout in ms
+##    ->{"interdigittimeout"}    -- between-digit timeout in ms
+##    ->{"termtimeout"}    -- timeout after match before terminator digit in ms
+##    ->{"termchar"}       -- DTMF terminating character, or "" for none
+##    ->{"rec_maxtime"}    -- if defined, max time for a rec in ms
+##    ->{"rec_dtmfterm"}   -- whether to terminate record on DTMF
+##    ->{"record_tone"}    -- whether to play a tone for record
+##    ->{"rec_finalsilence"}-- final silence timeout of record in ms
+##    ->{"rec_type"}       -- type of audio to record, one of "audio/basic",
+##			      "audio/x-alaw-basic", "audio/x-wav"
+##    ->{"rec_file"}       -- if defined, file currently recording into
+##    ->{"timed_out"}      -- if defined, DTMF collection timed out
+##    ->{"got_termchar"}   -- if defined, got DTMF termination character
+##    ->{"htcache_req_id"} -- if defined, htcache request id parsing
+
+##  Maps callid to filehandle of corresponding VXML_INTERP
+$::Callid_to_vxml_fh = {};
+
+##  Maps http cache request id's to:
+##    ->{"vxml_fh"}     -- filehandle of requesting VXML thread (may go away)
+##    ->{"type"}	-- "a" for audio, "v" for VXML
+##    ->{"index"}       -- index of requested sound file in play_queued array
+##			   (only defined if "type" is "a")
+$::HC_request_id_info = {};
+
+##  Maps grammar text to its SRGSDTMF-parsed rule
+$::Gram_text_to_rule = {};
+
+use constant FHINFO_TYPE_UNKNOWN => 0;
+use constant FHINFO_TYPE_DYNLOG => 1;
+use constant FHINFO_TYPE_VXILOG => 2;
+use constant FHINFO_TYPE_CT_SERVER => 3;
+use constant FHINFO_TYPE_VXML_INTERP => 4;
+use constant FHINFO_TYPE_SOUND_CACHE => 5;
+use constant FHINFO_TYPE_SOUND_CACHE_CLIENT => 6;
+use constant FHINFO_TYPE_CMD_LISTENER => 7;
+use constant FHINFO_TYPE_CMD => 8;
+use constant FHINFO_TYPE_DEAD => 9;
+
+@::Fhinfo_type_description =
+  (
+   "unknown",
+   "DynLog",
+   "VXML log",
+   "CT server",
+   "VXML interpreter",
+   "HTTP Cache",
+   "Voiceglue Main",
+   "Command Listener",
+   "Command",
+   "Dead"
+  );
+
+##  OVXI Messages
+use constant OVXI_UNDEFINED => 0;
+use constant OVXI_STARTED => 1;
+use constant OVXI_ACTIVATEGRAMMAR => 2;
+use constant OVXI_DEACTIVATEGRAMMAR => 3;
+use constant OVXI_RECOGNIZE => 4;
+use constant OVXI_PLAY => 5;
+use constant OVXI_QUEUE => 6;
+use constant OVXI_WAIT => 7;
+use constant OVXI_BUILTIN => 8;
+use constant OVXI_GETLINESTATUS => 9;
+use constant OVXI_DISCONNECT => 10;
+use constant OVXI_TRANSFER => 11;
+use constant OVXI_RECORD => 12;
+use constant OVXI_GRAMMAR => 13;
+use constant OVXI_GETPCMPATH => 14;
+use constant OVXI_PCMQUEUE => 15;
+use constant OVXI_EXITVAL => 16;
+use constant OVXI_FREEGRAMMAR => 17;
+use constant OVXI_HTTPGET => 18;
+use constant OVXI_VXMLPARSE => 19;
+
+$::OVXIMsgToOVXIType = {
+			"started" => OVXI_STARTED,
+			"ActivateGrammar" => OVXI_ACTIVATEGRAMMAR,
+			"DeactivateGrammar" => OVXI_DEACTIVATEGRAMMAR,
+			"FreeGrammar" => OVXI_FREEGRAMMAR,
+			"Recognize" => OVXI_RECOGNIZE,
+			"Play" => OVXI_PLAY,
+			"Queue" => OVXI_QUEUE,
+			"Wait" => OVXI_WAIT,
+			"Builtin" => OVXI_BUILTIN,
+			"GetLineStatus" => OVXI_GETLINESTATUS,
+			"Disconnect" => OVXI_DISCONNECT,
+			"Transfer" => OVXI_TRANSFER,
+			"Record" => OVXI_RECORD,
+			"Grammar" => OVXI_GRAMMAR,
+			"GetPCMPath" => OVXI_GETPCMPATH,
+			"PCMQueue" => OVXI_PCMQUEUE,
+			"exitval" => OVXI_EXITVAL,
+			"HttpGet" => OVXI_HTTPGET,
+			"VXMLParse" => OVXI_VXMLPARSE,
+			};
+
+$::OVXITypeToOVXIMsg = {};  ##  Filled in later from $::OVXIMsgToOVXIType
+
+##  OVXI Input Message Decoding Table
+##    Each element is [<fieldname>, ...]
+$::OVXI_Input_Format =
+{
+ OVXI_STARTED() => ["msg"],
+ OVXI_ACTIVATEGRAMMAR() => ["gram_id"],
+ OVXI_DEACTIVATEGRAMMAR() => ["gram_id"],
+ OVXI_RECOGNIZE() => ["properties"],
+ OVXI_PLAY() => [],
+ OVXI_QUEUE() => ["speak_spec", "bargein"],
+ OVXI_HTTPGET() => ["method", "url", "postdata", "parsevxml"],
+ OVXI_VXMLPARSE() => ["ok", "addr"],
+ OVXI_WAIT() => [],
+ OVXI_BUILTIN() => ["grammar"],
+ OVXI_GETLINESTATUS() => [],
+ OVXI_DISCONNECT() => [],
+ OVXI_TRANSFER() => ["url", "from", "xfer_type", "timeout"],
+ OVXI_RECORD() => ["properties"],
+ OVXI_GRAMMAR() => ["gram_id", "gram_type", "grammar", "properties"],
+ OVXI_GETPCMPATH() => ["pcm_id", "pcm_type"],
+ OVXI_PCMQUEUE() => ["path", "bargein"],
+ OVXI_EXITVAL() => ["varspec"],
+ OVXI_FREEGRAMMAR() => ["gram_id"],
+};
+
+##  OVXI Field Input Conversions
+
+##  $hash = parse_ovxi_properties ($string)
+##    Given $string containing OVXI properties in a=b;c=d form,
+##    returns a hashref representing it
+sub parse_ovxi_properties
+{
+    my ($string) = shift (@_);
+    my ($result) = {};
+    my ($ok, $msg, $spec, $specs);
+    ($ok, $msg, $specs) = Satc::_parse_SATC_fields ($string);
+    if (! $ok)
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR,
+		   "cannot parse properties: $msg on $string");
+	};
+	return $result;
+    };
+    foreach $spec (@$specs)
+    {
+	if ($spec =~ /^([^=]+)=(.+)$/)
+	{
+	    $result->{$1} = $2;
+	};
+    };
+    return $result;
+};
+
+##  OVXI Field Input Conversion Table
+##    Maps those OVXI field names that need conversion on input
+$::OVXI_Input_Conversion =
+{
+ "properties" => \&parse_ovxi_properties,
+};
+
+use constant NLSML_NOINPUT => "<?xml version='1.0'?> <result> <interpretation> <instance/> <input><noinput/></input> </interpretation> </result>";
+use constant NLSML_NOMATCH => "<?xml version='1.0'?> <result> <interpretation> <instance/> <input><nomatch/></input> </interpretation> </result>";
+
+###########################################################
+##  Message Data Structures
+
+##  incoming OVXI messages are represented by a hash:
+##    int msgtype;        //  one of the OVXI_* odes
+##    int callid;
+##    String msg;
+
+#################################################################
+##  Start of runtime code (sort of)
+
+$::Next_hcrequest_id = 1000;
+
+##  $string = dump_bytes ($item)
+##    -- Returns one-line string representation of bytes in string $item
+sub dump_bytes
+{
+    my ($item) = shift (@_);
+    my ($result);
+
+    $result = Satc::_escape_SATC_string ($item);
+    return ($result);
+};
+
+$::Last_day = (localtime)[7];
+
+##  Returns the system time in seconds in floating point
+##  with up to microsecond resolution
+sub systime
+{
+    my ($sec, $usec);
+
+    ($sec, $usec) = gettimeofday();
+    return ($sec + $usec / 1000000);
+};
+
+##  &four_byte_to_dot_separated ($four_byte_ip_addr)
+##    Converts 4-byte IP addresses to dot-notation IP addresses
+sub four_byte_to_dot_separated
+{
+    my ($four_byte) = shift (@_);
+    return (join (".", unpack ("C4", $four_byte)));
+};
+
+##  ($ok, $msg, @lines) = getfile_lines ($path);
+##    Reads an entire file, returns result in lines.
+sub getfile_lines
+{
+    my ($path) = shift (@_);
+    my (@lines);
+    open (::VGGETFILEFH, $path)
+      || return (0, "Cannot open \"$path\" for reading: $!");
+    @lines = <::VGGETFILEFH>;
+    close (::VGGETFILEFH)
+      || return (0, "Cannot close \"$path\" after reading: $!");
+    return (1, "", @lines);
+};
+
+##  ($ok, $msg, $contents) = getfile ($path);
+##    Reads an entire file, returning result in single scalar.
+sub getfile
+{
+    my ($path) = shift (@_);
+    my ($ok, $msg, @lines);
+    ($ok, $msg, @lines) = getfile_lines ($path);
+    $ok || return ($ok, $msg, undef);
+    return ($ok, $msg, join ("", @lines));
+};
+
+##  $result = urldecode_single ($urlencoded);
+##    url-decodes a single parameter
+sub urldecode_single
+{
+    my ($theURL) = shift (@_);
+    $theURL =~ tr/+/ /;
+    $theURL =~ s/%([a-fA-F0-9]{2,2})/chr(hex($1))/eg;
+    $theURL =~ s/<!–(.|\n)*–>//g;
+    return $theURL;
+}
+
+##  @params = urldecode ($input)
+##    url-decodes zero or more parameters
+sub urldecode
+{
+    my ($input) = shift (@_);
+    return map {urldecode_single($_)} split (/&/, $input);
+};
+
+##  $result = clean_url_path ($url)
+##    -- Removes "." and ".." from $url
+sub clean_url_path
+{
+    my ($orig) = shift (@_);
+    my (@components) = split (/\//, $orig);
+    my ($new);
+    my ($i) = 0;
+    while ($i < scalar(@components))
+    {
+	if ($components[$i] eq ".")
+	{
+	    splice (@components, $i, 1);
+	}
+	elsif (($components[$i] eq "..") && ($i > 0))
+	{
+	    splice (@components, $i-1, 2);
+	}
+	else
+	{
+	    ++$i;
+	};
+    };
+    $new = join ("/", @components);
+    if ($orig ne $new)
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG,
+		   "clean_url_path() converted: \"$orig\" -> \"$new\"");
+	};
+    };
+    return $new;
+};
+
+##  $result = parse_vxml_timeval ($string_value [, $default_units])
+##    -- Returns millisecond representation of VXML time value
+##       in $string_value, or undef if unparseable.
+##       If units are missing, uses $default_units.
+sub parse_vxml_timeval
+{
+    my ($string_value) = shift (@_);
+    my ($default_units) = shift (@_);
+    my ($number, $units);
+    defined ($string_value) || return undef;
+    if ($string_value =~ /^\s*\+?(\d+)(m?s)\s*$/)
+    {
+	$number = $1;
+	$units = $2;
+    }
+    elsif ($string_value =~ /^\s*\+?(\.\d+)(m?s)\s*$/)
+    {
+	$number = $1;
+	$units = $2;
+    }
+    elsif ($string_value =~ /^\s*\+?(\d+\.\d+)(m?s)\s*$/)
+    {
+	$number = $1;
+	$units = $2;
+    }
+    elsif (defined ($default_units) &&
+	    ($string_value =~ /^\s*\+?(\d+)\s*$/))
+    {
+	$number = $1;
+	$units = $default_units;
+    }
+    elsif (defined ($default_units) &&
+	   ($string_value =~ /^\s*\+?(\.\d+)\s*$/))
+    {
+	$number = $1;
+	$units = $default_units;
+    }
+    elsif (defined ($default_units) &&
+	   ($string_value =~ /^\s*\+?(\d+\.\d+)\s*$/))
+    {
+	$number = $1;
+	$units = $default_units;
+    }
+    else
+    {
+	return undef;
+    };
+    if ($units eq "s")
+    {
+	return $number * 1000;
+    };
+    return $number + 0;
+};
+
+##  $result = parse_vxml_timeval ($string_value)
+##    -- Returns boolean representation of VXML bool value
+##       in $string_value, or undef if unparseable.
+sub parse_vxml_bool
+{
+    my ($string_value) = shift (@_);
+    defined ($string_value) || return undef;
+    if ($string_value =~ /^\s*true\s*$/i)
+    {
+	return 1;
+    };
+    if ($string_value =~ /^\s*false\s*$/i)
+    {
+	return 0;
+    };
+    return undef;
+};
+
+##  $stopkeys = translate_stopkeys ($stopkeys)
+##    --  Translates $stopkeys that may contain "+" for all
+##        or "-" for none to the keysequence equivalent
+sub translate_stopkeys
+{
+    my ($stopkeys) = shift (@_);
+
+    ($stopkeys eq "+") && ($stopkeys = "0123456789#*");
+    ($stopkeys eq "-") && ($stopkeys = "");
+    return ($stopkeys);
+};
+
+##  openlogfile ($initial)
+##    Opens a new log file, setting ::LOGFH to its handle.
+##    The file name is taken from $::Logfile.
+##    If $initial is true, append an existing file if reasonable.
+##    Rotates existing log files that may already be there.
+sub openlogfile
+{
+    my ($initial) = shift (@_);
+    my ($i, $from, $to, @params);
+
+    if ($::Logfile eq "-")
+    {
+	##  Just use STDOUT
+	open (::LOGFH, ">&STDOUT")
+	  || die ("cannot open ::LOGFH to STDOUT (dup): $!");
+    }
+    else
+    {
+	##  See if the current file is OK (if initial)
+	if ($initial &&
+	    scalar (@params = stat ($::Logfile)) &&
+	    defined ($params[7]) &&
+	    ($params[7] < ($::Max_log_file_size - 1024)))
+	{
+	    ##  Current one is OK
+	    open (::LOGFH, ">>$::Logfile")
+	      || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	    $::Current_log_file_size = $params[7];
+	    select ((select (::LOGFH), $| = 1)[0]);
+	}
+	else
+	{
+	    ##  Rotate
+	    for ($i = $::Number_of_previous_kept - 1; $i >= 0; --$i)
+	    {
+		$from = join (".", $::Logfile, $i);
+		$to = join (".", $::Logfile, $i+1);
+		(-e $from) && rename ($from, $to);
+	    };
+	    (-e $::Logfile)
+	      && rename ($::Logfile, join (".", $::Logfile, "0"));
+	    ##  Open new
+	    open (::LOGFH, ">$::Logfile")
+	      || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	    $::Current_log_file_size = 0;
+	    select ((select (::LOGFH), $| = 1)[0]);
+	};
+    };
+};
+
+sub log_new_day
+{
+    my ($out);
+    my (@dateinfo) = localtime;
+
+    if ((! defined ($::Loghost)) || $::Time_of_next_connect_to_log_server)
+    {
+	$::Last_day = $dateinfo[7];
+	$out = join (" ",
+		     "============",
+		     "====",
+		     "LOGSRV",
+		     "LGSRVMAI",
+		     "Today is",
+		     sprintf ("%04d/%02d/%02d",
+			      $dateinfo[5] + 1900,
+			      $dateinfo[4] + 1,
+			      $dateinfo[3]
+			     )) . "\n";
+	(print ::LOGFH ($out))
+	  || warn ("Cannot write to log file: $!");
+	$::Current_log_file_size += length ($out);
+    };
+};
+
+##  logtofile ($msg_level, $msg, $module_name, $thread_name)
+##    Logs to the log file the with level $msg_level
+##    message $msg with module name $module_name
+sub logtofile
+{
+    my ($msg_level) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($module_name) = shift (@_);
+    my ($thread_name) = shift (@_);
+    my ($out, $usec, $timestamp, @dateinfo);
+
+    ($msg_level <= $::Loglevel) || return;
+    ($msg =~ /\n$/) || ($msg .= "\n");
+
+    ##  Check for need to rotate
+    if (($::Logfile ne "-") &&
+	($::Current_log_file_size >= $::Max_log_file_size))
+    {
+	(print ::LOGFH
+	 ("============ ==== LOGSRV LGSRVMAI End log file, rotating log\n"))
+	  || warn ("Cannot write to log file: $!");
+	&openlogfile (0);
+    };
+
+    $usec = systime();
+    @dateinfo = localtime (int ($usec));
+    if ($::Last_day != $dateinfo[7])
+    {
+	##  The day just changed
+	log_new_day();
+    };
+    $timestamp = join ("", sprintf ("%02d:%02d:%02d:%03d",
+				    $dateinfo[2],
+				    $dateinfo[1],
+				    $dateinfo[0],
+				    int ($usec / 1000)));
+    $out = join (" ",
+		 $timestamp,
+		 (($msg_level < 0) ? "====" :
+		  $::Msg_level_strings[$msg_level]),
+		 $module_name,
+		 $msg);
+    (print ::LOGFH ($out))
+      || Carp::cluck ("Cannot write to log file: $!");
+    $::Current_log_file_size += length ($out);
+};
+
+##  opendynlog()
+##    Attempts to open a connection to the dynlog server.
+##    On success, it sets $::Time_of_next_connect_to_log_server to 0.
+sub opendynlog
+{
+    my ($ok, $msg);
+
+    $::Time_of_next_connect_to_log_server &&
+      logtofile (LOG_INFO, "connecting to log server on host $::Loghost",
+		 $::Dynlog_Mymodule, $::Dynlog_Mythread);
+    ($ok, $msg) = $::Scom->connect ($::Log_fh, $::Loghost, 6410, ".:", 1);
+    if (! $ok)
+    {
+	logtofile (LOG_INFO,
+		   "cannot connect to log server on host $::Loghost: $msg",
+		   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+	$::Time_of_next_connect_to_log_server =
+	  time + $::Interval_between_log_server_connect_attempts;
+    }
+    else
+    {
+	$::Time_of_next_connect_to_log_server = 0;
+	$::Fhinfo->{$::Log_fh} = {"type" => FHINFO_TYPE_DYNLOG,
+				  "host" => (gethostbyname ($::Loghost))[4]};
+    };
+};
+
+##  &dynlog ($log_level, $msg, $module_name, $thread_name);
+##    Submit a logging message $msg at level $log_level
+sub dynlog
+{
+    my ($msg_level) = shift (@_);
+    my ($logmsg) = shift (@_);
+    my ($module_name) = shift (@_);
+    my ($thread_name) = shift (@_);
+    my ($ok, $msg, $tdstamp, $sec, $usec, @dateinfo, $timestamp, $dynlogmsg);
+
+    $::Time_of_next_connect_to_log_server && return;
+    ($msg_level > $::Loglevel)  && return;
+    if ($msg_level == -1)
+    {
+	##  A status/event message
+    }
+    else
+    {
+	##  A log message
+	$dynlogmsg = $logmsg;
+	$dynlogmsg =~ s/\n/\x01/gs;
+	$dynlogmsg = $msg_level . $module_name ." "
+	  . $thread_name . "\t" . $dynlogmsg . "\n"
+    };
+    if (! (($ok, $msg) = $::Scom->write ($::Log_fh, $dynlogmsg))[0])
+    {
+	logtofile (LOG_INFO,
+		   "error writing to log server on host $::Loghost: $msg\n",
+		   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+	logtofile ($msg_level, $logmsg,
+		   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+	$::Scom->unregister ($::Log_fh);
+	$::Time_of_next_connect_to_log_server =
+	  time + $::Interval_between_log_server_connect_attempts;
+    };
+};
+
+##  logit ($msg_level, $msg [, $module [, $thread]])
+##    Logs to the current log destination with level $msg_level
+##    message $msg.  Optionally supply $module name and $thread name.
+sub logit
+{
+    my ($msg_level) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($module_name) = shift (@_);
+    my ($thread_name) = shift (@_);
+
+    ($msg_level <= $::Loglevel) || return;
+
+    $msg =~ s/\n/\\n/g;
+
+    defined ($module_name) || ($module_name = $::Dynlog_Mymodule);
+    defined ($thread_name) || ($thread_name = $::Dynlog_Mythread);
+
+    if ((! defined ($::Loghost)) || $::Time_of_next_connect_to_log_server)
+    {
+	logtofile ($msg_level, $msg, $module_name, $thread_name);
+    }
+    else
+    {
+	dynlog ($msg_level, $msg, $module_name, $thread_name);
+    };
+};
+
+##  &fail ($msg)
+##    -- This die handler outputs to logit before exit
+sub fail
+{
+    my ($msg) = shift (@_);
+    my ($fh);
+
+    if (defined ($::Loghost) && (! $::Time_of_next_connect_to_log_server))
+    {
+	##  Dynlog is running.  First, kill all non-logging handles.
+	foreach $fh (keys (%$::Fhinfo))
+	{
+	    if ($fh ne $::Log_fh)
+	    {
+		$::Scom->unregister ($fh);
+	    };
+	};
+	##  Next, send the message and wait for it to finish, 10 seconds max
+	dynlog (LOG_CRIT, Carp::longmess ($msg),
+		$::Dynlog_Mymodule, $::Dynlog_Mythread);
+	$::Scom->close_on_flush ($::Log_fh);
+	while (scalar ($::Scom->getevents (10))) {};
+    }
+    else
+    {
+	logtofile (LOG_CRIT, Carp::longmess ($msg),
+		   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+    };
+
+    confess ($msg);
+};
+
+##  ($ok, $msg, $maxfds) = &increase_descriptors()
+##    Increases file descriptors to the max, and returns how many in $maxfds
+##    and how many it started out as in $origfds
+sub increase_descriptors
+{
+    my ($rlimit_max, $rlimit_cur, $rlimit_new);
+    my ($resource) = RLIMIT_NOFILE;
+
+    scalar (($rlimit_cur, $rlimit_max) = getrlimit ($resource))
+      || return (0, "getrlimit failed $!");
+    ##  File descriptor limit started at $rlimit_cur
+    $rlimit_new = $rlimit_max;
+    $> || ($rlimit_new = 8192);
+    if (! $::Valgrind)
+    {
+	setrlimit ($resource, $rlimit_new, $rlimit_new)
+	  || return (0, "setrlimit failed: $!");
+    };
+    ## File descriptor limit set to maximum $rlimit_cur
+    return (1, "", $rlimit_new);
+};
+
+##  ($ok, $msg) = &enable_core_dumps()
+##    Enables core dumps
+sub enable_core_dumps
+{
+    my ($rlimit_max, $rlimit_cur);
+    my ($resource) = RLIMIT_CORE;
+
+    scalar (($rlimit_cur, $rlimit_max) = getrlimit ($resource))
+      || return (0, "getrlimit failed $!");
+    $rlimit_cur = $rlimit_max;
+    setrlimit ($resource, $rlimit_cur, $rlimit_max)
+      || return (0, "setrlimit failed: $!");
+    return (1, "");
+};
+
+##  &describe_fh ($fh)
+##    Returns text description of client at fh $fh (for logging)
+sub describe_fh
+{
+    my ($fh) = shift (@_);
+    my ($fhinfo, $result);
+
+    (defined ($fhinfo = $::Clients->{$fh}))
+      || return ("unknown fh=\"$fh\"");
+    $result = $::Fhinfo_type_description[$fhinfo->{"type"}] .
+      " on fh=\"$fh\" at host=" . $fhinfo->{"host"};
+    defined ($fhinfo->{"callid"})
+      && ($result .= " callid=[" . $fhinfo->{"callid"} . "]");
+    return ($result);
+};
+
+##  remove_client ($client_fh)
+##    Removes client from internal data structures
+##    (Does not affect system filehandles)
+sub remove_client
+{
+    my ($fh) = shift (@_);
+
+    ##  See if an end-of-call url should be sent
+    my ($clientinfo) = $::Clients->{$fh};
+    if ($clientinfo->{"type"} == FHINFO_TYPE_VXML_INTERP)
+    {
+	my ($url_hangup_field) = $clientinfo->{"url_hangup_field"};
+	my ($url) = $clientinfo->{"url"};
+	if (defined ($url) && length ($url_hangup_field))
+	{
+	    ##  Send end-of-call url
+	    $url .= "&" . $url_hangup_field . "=1";
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $clientinfo->{"callid"} .
+		       "] calling hangup URL : " . $url);
+	    };
+	    system
+	      ("curl -s -f -o /dev/null '$url' < /dev/null > /dev/null 2>&1 &");
+	};
+    };
+
+    delete $::Clients->{$fh};
+};
+
+##  clean_up_stopped_vxml_thread ($fh)
+##    -- Call when a VXML thread stops
+sub clean_up_stopped_vxml_thread
+{
+    my ($fh) = shift;
+    my ($fhinfo) = $::Clients->{$fh};
+    my ($callid) = $fhinfo->{"callid"};
+    my ($ok, $msg, $cookie_jar_path);
+
+    ##  Must clean up the VXML thread
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] deallocating VXML thread");
+    };
+    ($ok, $msg) = Vxglue::_stop_voiceglue_thread ($fhinfo->{"call_handle"});
+    if ((! $ok)  && ($::Loglevel >= LOG_EROR))
+    {
+	logit (LOG_EROR, "callid=[" . $callid .
+	       "] got failure from _stop_voiceglue_thread");
+    };
+    --$::VXML_threads;
+
+    ##  Clean up the cookie jar file (if any)
+    if (defined ($cookie_jar_path = $fhinfo->{"cookie_file"}))
+    {
+	unlink ($cookie_jar_path);
+    };
+
+    if (defined ($callid) && defined ($fhinfo->{"connected"}))
+    {
+	##  Must release the call
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI, "callid=[" . $callid .
+		    "] releasing call because VXML interpreter exited");
+	send_ct_client_msg
+	  ($::CTSrvInfo, {Satc::MSGTYPE => Satc::RELEASE,
+			  Satc::CALLID => $callid});
+	delete $fhinfo->{"connected"};
+    };
+
+    POSIX::close ($fhinfo->{"vxml_fd"});
+    delete $::Callid_to_vxml_fh->{$callid};
+
+    if (($::VXML_threads == 0) && ($::Stop_requested))
+    {
+	$::Finished = 1;
+    };
+}
+
+
+##  fh_stopped ($fh, $msg)
+##    -- Entry point for when any filehandle terminates.
+##       If $msg is length non-0, then it contains the
+##       failure reason for the stoppage.
+sub fh_stopped
+{
+    my ($fh) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($ok, $fhinfo, $type, $severity, $logmsg, $callid);
+
+    ##  Determine severity
+    defined ($fhinfo = $::Clients->{$fh})
+      && ($type = $fhinfo->{"type"});
+    if ((! defined ($type)) ||
+	($type == FHINFO_TYPE_UNKNOWN) ||
+	($type == FHINFO_TYPE_DEAD) ||
+	($type == FHINFO_TYPE_CMD_LISTENER) ||
+	($type == FHINFO_TYPE_CMD) ||
+	($type == FHINFO_TYPE_VXML_INTERP))
+    {
+	$severity = LOG_EROR;
+    }
+    elsif (($type == FHINFO_TYPE_CT_SERVER) ||
+	   ($type == FHINFO_TYPE_SOUND_CACHE))
+    {
+	$severity = LOG_EMRG;
+    }
+    else
+    {
+	$severity = LOG_INFO;
+    };
+
+    $logmsg = $::Fhinfo_type_description[$type] .
+      " filehandle \"$fh\" stopped: " . $msg;
+    if ($::Loglevel >= $severity)
+    {
+	logit ($severity, $logmsg);
+    };
+    ($severity == LOG_EMRG) && fail ($logmsg);
+
+    if ($type == FHINFO_TYPE_SOUND_CACHE_CLIENT)
+    {
+	if ($::Loglevel >= LOG_NOTI)
+	{
+	    logit (LOG_NOTI, "HTTP Cache terminating");
+	};
+	##  Suck up all children so there are no zombies
+	waitfor_httpcache_children();
+	exit (0);
+    };
+
+    if ($type == FHINFO_TYPE_VXML_INTERP)
+    {
+	$callid = $fhinfo->{"callid"};
+	if ((! $ok)  && ($::Loglevel >= LOG_EROR))
+	{
+	    logit (LOG_EROR, "callid=[" . $callid .
+		   "] lost its VXML interpreter");
+	};
+
+	##  This cleans up the C-side fh
+	clean_up_stopped_vxml_thread ($fh);
+    };
+
+    remove_client ($fh);
+};
+
+##  ($ok, $msg, $result) = parse_ovxi_msg ($fh_spec, $bytes)
+##    Returns in $result a hash representing the parsed OpenVXI message
+##    in $bytes that came in on filehandle with hash representation $fh_spec.
+sub parse_ovxi_msg
+{
+    my ($fh_spec) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ok, $msg, $field_name, $conversion);
+    my ($orig_bytes, $msgtype, $format, $field, $quotechar, $fields);
+
+    ##  Have to decode OpenVXI msg in $bytes
+
+    ##  First, break it into fields and get the msgtype
+    $orig_bytes = $bytes;
+    (($ok, $msg, $fields) = Satc::_parse_SATC_fields ($bytes))[0]
+      || return (0, "Cannot parse SATC message \"" . $orig_bytes . "\": $msg");
+    scalar (@$fields)
+      || return (0, "Ignoring empty SATC message \"" . $orig_bytes . "\"");
+    defined ($msgtype = $::OVXIMsgToOVXIType->{$fields->[0]})
+      || return (0, "Unknown OVXI command \"" . $fields->[0] .
+		 "\" in message \"" . $orig_bytes . "\"");
+
+    ##  Now build up hash representing the message
+    defined ($format = $::OVXI_Input_Format->{$msgtype})
+      || return (0, "Unknown OVXI format for \"" . $fields->[0] .
+		 "\" in message \"" . $orig_bytes . "\"");
+    $msg = {msgtype => $msgtype};
+    shift (@$fields);
+    foreach $field_name (@$format)
+    {
+	defined ($field = shift (@$fields))
+	  || return (0,  "Insufficient fields in OVXI message \"" .
+		     $orig_bytes . "\"");
+	if (defined ($conversion = $::OVXI_Input_Conversion->{$field_name}))
+	{
+	    $field = &$conversion ($field);
+	};
+	$msg->{$field_name} = $field;
+    };
+
+    ##  Callid is implicit in the fh_info
+    $msg->{Satc::CALLID} = $fh_spec->{"callid"};
+
+    return (1, "", $msg);
+};
+
+##  describe_ovxi_msg ($msg)
+##    --  Returns string describing the OVXI message
+##        contained in hash $msg
+sub describe_ovxi_msg
+{
+    my ($msg) = shift (@_);
+    my (@result) = ();
+    my ($msgtype) = $msg->{"msgtype"};
+    my ($field, $value);
+
+    push (@result, $::OVXITypeToOVXIMsg->{$msgtype});
+    push (@result, " callid=", $msg->{"callid"});
+    foreach $field (sort (keys (%$msg)))
+    {
+	if (($field ne "callid") && ($field ne "msgtype") &&
+	    (defined ($value = $msg->{$field})))
+	{
+	    push (@result, " " . $field . "=" . $value);
+	};
+    };
+    return (join ("", @result));
+};
+
+##  send_bytes ($fhinfo, $bytes)
+##    -- Sends $bytes to filehandle represented by $fhinfo
+sub send_bytes
+{
+    my ($fhinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ok, $msg);
+
+    if ($fhinfo->{"type"} == FHINFO_TYPE_DEAD)
+    {
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG, "Not sending " .
+		    dump_bytes ($bytes) .
+		    " to "  . describe_fh ($fhinfo->{"fh"}));
+	return;
+    };
+
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, "snd " .
+		dump_bytes ($bytes) .
+		" to "  . $fhinfo->{"fh"});
+
+    ($ok, $msg) = $::Scom->write ($fhinfo->{"fh"}, $bytes);
+    if (! $ok)
+    {
+	fh_stopped ($fhinfo->{"fh"}, $msg);
+    };
+};
+
+##  send_ct_client_msg ($ctinfo, $ct_server_msg)
+##    -- Sends $ct_client_msg to the CT Server at $ctinfo
+sub send_ct_client_msg
+{
+    my ($ctinfo) = shift (@_);
+    my ($ctmsg) = shift (@_);
+    my ($ok, $msg, $format_string, $fmt, $type, $msgsize, $bytes, $callid);
+    my ($format, $field, $field_name, $conversion, $vxml_fh, $vxmlinfo);
+    my ($loglevel) = LOG_DBUG;
+    my (@tosend) = ();
+
+    ##  Convert it to serialized form
+    if (! (($ok, $msg, $bytes) = $::Satc->encode ($ctmsg))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR,
+		    "Cannot encode Satc message " .
+		    $::Satc->describe_msg ($ctmsg) .
+		    ": $msg ; cannot send to "
+		    . describe_fh ($ctinfo->{"fh"}));
+	return;
+    };
+
+    ##  Send it off, logging media messages a little higher
+    $callid = $ctmsg->{Satc::CALLID};
+    $type = $ctmsg->{Satc::MSGTYPE};
+    if (($type == Satc::PLAY) ||
+	($type == Satc::PLAYDIG) ||
+	($type == Satc::RECORD) ||
+	($type == Satc::GETDIG) ||
+	($type == Satc::TRANSFER) ||
+	($type == Satc::HANGUP))
+    {
+	$loglevel = LOG_INFO;
+    };
+    ($::Loglevel >= $loglevel)
+      && logit ($loglevel, (defined ($callid) ?
+			    ("callid=[" . $callid . "] ") : "")
+		. "snd " . $::Satc->describe_msg ($ctmsg) .
+		" to "  . describe_fh ($ctinfo->{"fh"}));
+
+    ##  Update satc_doing
+    if (defined ($callid) &&
+	defined ($vxml_fh = $::Callid_to_vxml_fh->{$callid}))
+    {
+	$vxmlinfo = $::Clients->{$vxml_fh};
+	$vxmlinfo->{"satc_doing"} = $ctmsg->{Satc::MSGTYPE};
+    };
+
+    send_bytes ($ctinfo, $bytes);
+};
+
+##  ($ok, $msg, $node) = nodelist_to_node ($node, $identifier)
+##    If parameter $node is not an XML::LibXML::NodeList, reutrns $node.
+##    If parameter $node is an XML::LibXML::NodeList and has one element,
+##    returns that element.
+##    If none of the above, returns undef for $node, and sets
+##    $msg to an error message using $identifier as the identifier of the node.
+sub nodelist_to_node
+{
+    my ($node) = shift (@_);
+    my ($identifier) = shift (@_);
+
+    if ($node->isa ("XML::LibXML::NodeList"))
+    {
+	if (scalar ($node->get_nodelist) != 1)
+	{
+	    return (0, "XML data invalid: " .
+		    $identifier . " has " .
+		    scalar ($node->get_nodelist) .
+		    " items (should be 1)\n");
+	};
+	return (1, "", ($node->get_nodelist)[0]);
+    }
+    else
+    {
+	return (1, "", $node);
+    };
+};
+
+##  ($ok, $msg, $prefix, $hosturl) = url_base_to_prefix ($base)
+##    -- Given a url in $base, converts it
+##       to a  $prefix (with trailing "/"), and
+##       a $hosturl (up tthrough the hostname) (no trailing "/").
+##       If $base is empty, returns "" and "" for $prefix and $hosturl.
+sub url_base_to_prefix
+{
+    my ($base) = shift (@_);
+    my ($prefix, $hosturl, @nodes);
+
+    if ((! defined ($base)) || (! length ($base)))
+    {
+	return (1, "", "", "");
+    };
+    if ($base =~ /\/[^\/]+$/s)
+    {
+	$prefix = $base;
+	$prefix =~ s/[^\/]+$//s;
+	if ($base =~ /^([^\/:]+:\/\/[^\/]+)\//s)
+	{
+	    $hosturl = $1;
+	    return (1, "", $prefix, $hosturl);
+	};
+    };
+    return (0, "Cannot parse base URL \"$base\"");
+};
+
+##  $clean_text = clean_tts_text ($tts_text)
+##    -- Returns $tts_text with ends cleaned of whitespace
+##       and newlines replaced with spaces
+sub clean_tts_text
+{
+    my ($tts_text) = shift (@_);
+    $tts_text =~ s/^\s+//s;
+    $tts_text =~ s/\s+$//s;
+    $tts_text =~ s/\n/ /sg;
+    return $tts_text;
+};
+
+##  $text = extract_tts($xml_node);
+##    Given speak spec XML node $xml_node, extracts the TTS text for it.
+##    Will return "" if none found.
+sub extract_tts
+{
+    my ($xml_node) = shift;
+    my ($text);
+
+    if ($::SSML_Passthrough)
+    {
+	$text = $xml_node->toString();
+
+	##  For some reason, OVXI is handing us SSML-non-standard
+	##  attributes, must remove these.
+	$text =~ s/fetchtimeout=\"[^\"]*\"//g;
+	$text =~ s/fetchhint=\"[^\"]*\"//g;
+	$text =~ s/maxage=\"[^\"]*\"//g;
+    }
+    else
+    {
+	$text = $xml_node->textContent;
+    }
+    if (defined ($text) && length ($text))
+    {
+	$text = clean_tts_text ($text);
+    }
+    defined ($text) || ($text = "");
+    return $text;
+};
+
+##  ($ok, $msg, [@specs]) = parse_speak_xml ($xml_text);
+##    Given XML text in $xml_text, extracts into @specs a list of hashes
+##    containing the following fields:
+##                 {"tts"}          -- if defined, the tts text to convert
+##                 {"url"}          -- if defined, the url to download
+##                 {"timeout"}      -- in seconds for creation
+##                 {"maxage"}       -- if defined, in seconds for cacheing
+##                 {"lang"}         -- the xml:lang value (e.g. "en")
+sub parse_speak_xml
+{
+    my ($xml_text) = shift (@_);
+    my ($xml_parser, $xml_doc, $root, $node, $ok, $msg, $specs, $audio_url);
+    my (@children, $child, $xmlbase, $prefix, $hosturl, $src, @nodes);
+    my ($spec, $text, $maxage, $timeout, $lang);
+
+    ##  For some reason, OpenVXI is passing \x90 and \x902x for spaces
+    $xml_text =~ s/\x902x/ /g;
+    $xml_text =~ s/\x90/ /g;
+
+    ##  Parse the <speak>
+    $xml_parser = XML::LibXML->new();
+    eval
+    {
+	$xml_doc = $xml_parser->parse_string ($xml_text);
+    };
+    (length ($@))
+      && (return (0, "Cannot parse prompt XML: $@"));
+
+    ##  Look for xml:base in the root
+    $root = $xml_doc->documentElement;
+    ##  Parse out the url prefix for this <speak>
+    $xmlbase = $root->findvalue ("\@xml:base");
+    (($ok, $msg, $prefix, $hosturl) = url_base_to_prefix ($xmlbase))[0]
+      || return (0, "xml:base parse error: $msg");
+
+    ##  Look for xml:lang in the root
+    $root = $xml_doc->documentElement;
+    $lang = $root->findvalue ("\@xml:lang");
+    defined ($lang) && length ($lang) || ($lang = "en");
+
+    ##  Extract specs from all <audio> children
+    $specs = [];
+    @children = $root->childNodes;
+    foreach $child (@children)
+    {
+	if ($child->nodeName eq "audio")
+	{
+	    $spec = {};
+
+	    ##  Look for src
+	    $src = $child->findvalue ("\@src");
+	    if (defined ($src) && length ($src))
+	    {
+		if ($src =~ /^\//)
+		{
+		    ##  Absolute path
+		    $audio_url = $hosturl . $src;
+		}
+		elsif ($src =~ /^[^:]+:\/\//s)
+		{
+		    ##  Absolute url
+		    $audio_url = $src;
+		}
+		else
+		{
+		    ##  Relative url
+		    $audio_url = $prefix . $src;
+		};
+		$spec->{"url"} = $audio_url;
+	    };
+
+	    ##  Look for maxage
+	    $maxage = $child->findvalue ("\@maxage");
+	    if (defined ($maxage) && length ($maxage))
+	    {
+		$spec->{"maxage"} = $maxage;
+	    };
+
+	    ##  Look for timeout
+	    $timeout = $child->findvalue ("\@fetchtimeout");
+	    if (defined ($timeout) && length ($timeout))
+	    {
+		$spec->{"timeout"} = $timeout;
+	    };
+
+	    ##  Look for tts text
+	    $text = extract_tts($child);
+	    if (length ($text))
+	    {
+		$spec->{"tts"} = $text;
+	    };
+
+	    if (defined ($spec->{"tts"}) ||
+		defined ($spec->{"url"}))
+	    {
+		$spec->{"lang"} = $lang;
+		push (@$specs, $spec);
+	    };
+	}
+	else
+	{
+	    ##  This is just raw tts, no enclosing <audio>
+	    $spec = {};
+	    $text = extract_tts($child);
+	    if (length ($text))
+	    {
+		$spec->{"tts"} = $text;
+		$spec->{"lang"} = $lang;
+		push (@$specs, $spec);
+	    };
+	};
+    };
+
+    return (1, "", $specs);
+};
+
+##  Returns perl variable suitable for r.h.s. of assignment
+##  in javascript code, enclosed by single-quotes.
+sub quote_javascript_string
+{
+    my ($orig) = shift;
+    $orig =~ s/'/\\'/g;
+    return "'" . $orig . "'";
+}
+
+##  handle_satc_incoming ($ctmsg)
+##    -- Handles SATC inoming message in $ctmsg
+sub handle_satc_incoming
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $perl_fh, $c_fh, $fh_spec, $call_handle, $jar_path);
+    my ($ok, $msg, $url, $ani, $dnis, $hangup_msg, $r, $arg, $part, @parts);
+    my ($urlparam, $urlparam_value, $args, %arghash, $c_fd, $pos, @arp_params);
+    my ($url_hangup_field) = "";
+    my ($javascript_init) = "connection.initargs = new Object();\n";
+
+    ##  Refresh the DNIS->URL mapping if necessary
+    if (! (($ok, $msg) = parse_configfile())[0])
+    {
+	($::Loglevel >= LOG_CRIT)
+	  && logit (LOG_CRIT, "Failure parsing $::Conffile: $msg");
+	return;
+    };
+    if ($ok == 2)
+    {
+	##  Just got a new set of DNIS mappings
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI, "Found changed urlfile, loaded " .
+		    scalar (keys (%$::URLmap)) .
+		    " mappings");
+    };
+
+    ##  Extract the phoneglue incoming call information
+    $callid = $ctmsg->{Satc::CALLID};
+    $dnis = $ctmsg->{Satc::DNIS};
+    $ani = $ctmsg->{Satc::ANI};
+    $arg = $ctmsg->{Satc::ARG};
+
+    ##  If there is an arg, parse out URL and/or params from it
+    if (defined ($arg) && length($arg))
+    {
+	##  Substitute for fields:
+	##    %%ani=	-- substitute ani
+	##    %%dnis=	-- substitute dnis
+	##    %%callid=	-- substitute phoneglue callid
+	$arg =~ s/\%\%ani/$ani/g;
+	$arg =~ s/\%\%dnis/$dnis/g;
+	$arg =~ s/\%\%callid/$callid/g;
+
+	$args = new CGI($arg);
+	%arghash = $args->Vars;
+
+	foreach $urlparam (keys (%arghash))
+	{
+	    $urlparam_value = $arghash{$urlparam};
+	    if ($urlparam eq "url")
+	    {
+		##  Extract special name "url" if found
+		$url = $urlparam_value;
+		delete $arghash{$urlparam};
+	    }
+	    ##  Handle field containing %%hangup specially
+	    elsif ($urlparam_value eq "\%\%hangup")
+	    {
+		$url_hangup_field = $urlparam;
+		delete $arghash{$urlparam};
+	    }
+	};
+
+	if (scalar (keys (%arghash)))
+	{
+	    ##  Place params back into the URL
+	    if (defined ($url))
+	    {
+		$url .=
+		  "?" . join ("&",
+			      map {join ("=", $_, uri_escape($arghash{$_}))}
+			      keys (%arghash));
+	    };
+
+	    ##  Place params into $javascript_init
+	    $javascript_init .=
+	      join (";\n", map
+		    {join (" = ",
+			   "connection.initargs." . $_,
+			   quote_javascript_string($arghash{$_}))}
+		    keys (%arghash)) . ";\n";
+	};
+    };
+    if (! ((defined ($url)) ||
+	   (defined ($url = $::URLmap->{$dnis})) ||
+	   (defined ($url = $::URLmap->{"*"}))))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "No matching URL for DNIS $dnis");
+	send_ct_client_msg ($::CTSrvInfo, {Satc::MSGTYPE => Satc::HANGUP,
+					   Satc::CALLID => $callid});
+	return;
+    };
+
+    ##  Create a new descriptor pair to communicate with a new VXML thread
+    ($ok, $msg, $perl_fh, $c_fh) =
+      Cam::Scom::c_socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC);
+    if (! $ok)
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unable to start VXML interpreter" .
+		    " on incoming call, failure from socketpair(): $msg");
+	send_ct_client_msg ($::CTSrvInfo, {Satc::MSGTYPE => Satc::HANGUP,
+					   Satc::CALLID => $callid});
+	return;
+    };
+    $c_fd = $c_fh;
+    $fh_spec = {"type" => FHINFO_TYPE_VXML_INTERP,
+		"fh" => $perl_fh,
+		"host" => "localhost",
+		"callid" => $callid,
+		"url" => $url,
+		"url_hangup_field" => $url_hangup_field,
+		"vxml_fd" => $c_fd,
+		"connected" => 1,
+		"processing" => 0,
+		"next_rec_num" => 0};
+    if (length ($url_hangup_field))
+    {
+	$url .= "&" . $url_hangup_field . "=0";
+    };
+
+    ($::Loglevel >= LOG_NOTI)
+      && logit (LOG_NOTI, "callid=[" . $callid .
+		"] starting VXML interp on url=\"" .
+		$url . "\" from ANI=\"" . $ani .
+		"\" for DNIS=\"" . $dnis . "\"" .
+		" javascript_init=\"" . $javascript_init . "\"" .
+		" perlfd=" . $perl_fh .
+		" vxmlfd=" . $c_fd .
+		" =#[#= " . sprintf ("%.3f", systime()) .
+		" call start " . $callid . " =#]#=");
+
+    ##  Start a new VXML thread
+    if (! (($ok, $msg, $call_handle) =
+	   Vxglue::_start_voiceglue_thread
+	   ($::Platform_handle, $callid, $c_fd, $url,
+	    $ctmsg->{Satc::ANI}, $ctmsg->{Satc::DNIS},
+	    $javascript_init))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Failure from start_voiceglue_thread: $msg");
+	POSIX::close ($perl_fh);
+	POSIX::close ($c_fd);
+	return;
+    };
+    $fh_spec->{"call_handle"} = $call_handle;
+
+    ##  Register the filehandle
+    if (! (($ok, $msg) = $::Scom->register ("$perl_fh+"))[0])
+    {
+	($::Loglevel >= LOG_CRIT)
+	  && logit (LOG_CRIT, "Failure from Scom->register on $perl_fh: $msg");
+	POSIX::close ($perl_fh);
+	POSIX::close ($c_fd);
+	send_ct_client_msg ($::CTSrvInfo, {Satc::MSGTYPE => Satc::HANGUP,
+					   Satc::CALLID => $callid});
+	return;
+    };
+
+    ##  Place it in $::Clients
+    $::Clients->{$perl_fh} = $fh_spec;
+    $::Callid_to_vxml_fh->{$callid} = $perl_fh;
+    ++$::VXML_threads;
+
+    ##  Create initially-empty cookie jar
+    $jar_path = join ("/", $::VgCacheDir, "cookie", $callid);
+    $fh_spec->{"cookie_file"} = $jar_path;
+    if (! (open (::FH, ">$jar_path") && close (::FH)))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR,  "callid=[" . $callid .
+		    "] Failure to initialize cookie jar file \"" .
+		    $jar_path . "\" : $!");
+    };
+};
+
+##  handle_satc_gotdig ($ctmsg)
+##    -- Handles SATC gotdig message in $ctmsg
+sub handle_satc_gotdig
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fhinfo, $fh);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid})) ||
+	(! defined ($fhinfo = $::Clients->{$fh})))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    ##  Check for errors
+    if ($ctmsg->{Satc::STATUS} != 0)
+    {
+	clear_play_and_rec ($fhinfo);
+	send_vxml_interp_msg ($fhinfo, join (" ",
+					     "Recognized",
+					     VXIrec_RESULT_FAILURE,
+					     NLSML_NOINPUT));
+	return;
+    };
+
+    if ($ctmsg->{Satc::REASON} == Satc::GOTDIGIT_REASON_TIMEOUT)
+    {
+	$fhinfo->{"timed_out"} = 1;
+    }
+    else
+    {
+	##  Accumulate new digits
+	defined ($fhinfo->{"got_dtmf"}) || ($fhinfo->{"got_dtmf"} = "");
+	if ((length ($fhinfo->{"termchar"}) == 1) &&
+	    (length ($ctmsg->{"digits"}) == 1) &&
+	    ($fhinfo->{"termchar"} eq $ctmsg->{"digits"}))
+	{
+	    ##  Got a terminator character
+	    $fhinfo->{"got_termchar"} = 1;
+	}
+	else
+	{
+	    $fhinfo->{"got_dtmf"} .= $ctmsg->{"digits"};
+	};
+    };
+
+    do_prompt_and_listen ($fhinfo);
+};
+
+##  handle_satc_transfered ($ctmsg)
+##    -- Handles SATC transfered message in $ctmsg
+sub handle_satc_transfered
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fhinfo, $fh);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid})) ||
+	(! defined ($fhinfo = $::Clients->{$fh})))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    ##  This must be in response to a vxml Transfer, so return the result
+    delete $fhinfo->{"transfer_requested"};
+    send_vxml_interp_msg ($fhinfo, join (" ",
+					 "Transferred",
+					 $ctmsg->{Satc::STATUS},
+					 $ctmsg->{Satc::MSG}));
+};
+
+##  handle_satc_recorded ($ctmsg)
+##    -- Handles SATC recorded message in $ctmsg
+sub handle_satc_recorded
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fh, $fhinfo);
+    my ($result, $reason, $duration, $digit, $path, @statinfo);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    $result = (($ctmsg->{Satc::STATUS} == 0) ? VXIrec_RESULT_SUCCESS
+	       : VXIrec_RESULT_FAILURE);
+    $reason = $ctmsg->{Satc::REASON};
+    $duration = $ctmsg->{Satc::DURATION};
+    $digit = $ctmsg->{Satc::DIGITS};
+    defined ($digit) && length ($digit) || ($digit = "-");
+
+    ##  See if channel is now gone
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid})) ||
+	(! defined ($fhinfo = $::Clients->{$fh})))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    $path = $fhinfo->{"rec_file"};
+    clear_play_and_rec ($fhinfo);
+
+    if ($ctmsg->{Satc::STATUS} != 0)
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Failure from record: " . $ctmsg->{Satc::MSG});
+    };
+
+    ##  Return result to ovxi
+    send_vxml_interp_msg ($fhinfo, join (" ", "Recorded", $result,
+					 $reason, $duration, $digit,
+					 $path));
+};
+
+##  handle_satc_played ($ctmsg)
+##    -- Handles SATC played message in $ctmsg
+sub handle_satc_played
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fh, $fhinfo);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid}) ||
+	(! defined ($fhinfo = $::Clients->{$fh}))))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    do_prompt_and_listen ($fhinfo);
+};
+
+##  handle_satc_playeddig ($ctmsg)
+##    -- Handles SATC playeddig message in $ctmsg
+sub handle_satc_playeddig
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fh, $fhinfo);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid}) ||
+	(! defined ($fhinfo = $::Clients->{$fh}))))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    do_prompt_and_listen ($fhinfo);
+};
+
+##  handle_satc_returnedvar ($ctmsg)
+##    -- Handles SATC returnedvar message in $ctmsg
+sub handle_satc_returnedvar
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fhinfo, $fh);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if ((! defined ($fh = $::Callid_to_vxml_fh->{$callid})) ||
+	(! defined ($fhinfo = $::Clients->{$fh})))
+    {
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI,
+		    "[$callid] Cannot find VXML filehandle, assuming deleted");
+	return;
+    };
+
+    ##  This must be in response to a vxml extival, so return the confirmation.
+    send_vxml_interp_msg ($fhinfo, "exitedval");
+};
+
+##  handle_satc_hungup_or_released ($ctmsg)
+##    -- Handles SATC hungup or released message in $ctmsg
+sub handle_satc_hungup_or_released
+{
+    my ($ctmsg) = shift (@_);
+    my ($callid, $fh, $fhinfo, $vxml_cmd);
+
+    $callid = $ctmsg->{Satc::CALLID};
+    if (defined ($fh = $::Callid_to_vxml_fh->{$callid}))
+    {
+	if (defined ($fhinfo = $::Clients->{$fh}))
+	{
+	    delete $fhinfo->{"connected"};
+	    ##  If a vxml interpreter is awaiting a result, it
+	    ##  must now be responsed to.
+	    ##  Could be one of:  Wait, Recognize, Transfer
+	    if (defined ($vxml_cmd = $fhinfo->{"vxml_doing"}))
+	    {
+		if ($vxml_cmd == OVXI_WAIT)
+		{
+		    send_vxml_interp_msg ($fhinfo, "Waited");
+		}
+		elsif ($vxml_cmd == OVXI_RECOGNIZE)
+		{
+		    send_vxml_interp_msg ($fhinfo,
+					  "Recognized 0 " . NLSML_NOINPUT);
+		}
+		elsif ($vxml_cmd == OVXI_TRANSFER)
+		{
+		    send_vxml_interp_msg ($fhinfo, "Transfered");
+		}
+		elsif ($vxml_cmd == OVXI_RECORD)
+		{
+		    send_vxml_interp_msg ($fhinfo, "Recorded");
+		};
+	    };
+	};
+    };
+};
+
+##  handle_msg_from_ct_server ($ctinfo, $bytes)
+##    -- Handles new message in $bytes coming from CT server
+##       described by $ctinfo
+sub handle_msg_from_ct_server
+{
+    my ($ctinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ok, $errmsg, $msg, $ctmsg);
+    my ($type, $callid, $url, $load, $total, $regs, $agiinfo);
+    my ($vxml_fh, $vxmlinfo);
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "rcv ctsrv: " . dump_bytes ($bytes));
+    };
+
+    ##  First, parse it into its fields
+    chop ($bytes);
+    (substr ($bytes, -1) eq "\r") && chop ($bytes);
+    if (! (($ok, $errmsg, $ctmsg) = $::Satc->decode ($bytes))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, $errmsg . " from " .
+		    describe_fh ($ctinfo->{"fh"}) . " in msg " .
+		    dump_bytes ($bytes));
+	return;
+    };
+
+    $callid = $ctmsg->{Satc::CALLID};
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG,
+		(defined ($callid) ? "callid=[" . $callid . "] " : "") .
+		"parsed " . $::Satc->describe_msg ($ctmsg));
+
+    ##  Update satc_doing
+    if (defined ($callid) &&
+	defined ($vxml_fh = $::Callid_to_vxml_fh->{$callid}))
+    {
+	$vxmlinfo = $::Clients->{$vxml_fh};
+	delete $vxmlinfo->{"satc_doing"};
+    };
+
+    ##  Now, branch based on message type
+    $type = $ctmsg->{Satc::MSGTYPE};
+    if ($type == Satc::INCOMING)
+    {
+	handle_satc_incoming ($ctmsg);
+    }
+    elsif ($type == Satc::GOTDIG)
+    {
+	handle_satc_gotdig ($ctmsg);
+    }
+    elsif ($type == Satc::PLAYED)
+    {
+	handle_satc_played ($ctmsg);
+    }
+    elsif ($type == Satc::PLAYEDDIG)
+    {
+	handle_satc_playeddig ($ctmsg);
+    }
+    elsif (($type == Satc::HUNGUP) ||
+	   ($type == Satc::RELEASED))
+    {
+	handle_satc_hungup_or_released ($ctmsg);
+    }
+    elsif ($type == Satc::TRANSFERED)
+    {
+	handle_satc_transfered ($ctmsg);
+    }
+    elsif ($type == Satc::RECORDED)
+    {
+	handle_satc_recorded ($ctmsg);
+    }
+    elsif ($type == Satc::STOPPEDIN)
+    {
+	##  No action necessary
+    }
+    elsif ($type == Satc::STOPPED)
+    {
+	##  No action necessary
+    }
+    elsif ($type == Satc::RETURNEDVAR)
+    {
+	handle_satc_returnedvar ($ctmsg);
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unsupported msg " .
+		    $::Satc->describe_msg ($ctmsg) .
+		    " from " .
+		    describe_fh ($ctinfo->{"fh"}));
+    };
+};
+
+##  send_vxml_interp_msg ($fhinfo, $ovxi_msg)
+##    -- Sends $ovxi_msg to the vxml interpreter at fd described by $fhinfo
+sub send_vxml_interp_msg
+{
+    my ($fhinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($callid);
+    my ($loglevel) = LOG_DBUG;
+
+    ##  Update vxml_doing
+    delete $fhinfo->{"vxml_doing"};
+
+    ##  Send it off, logging "Recognized" messages a little higher
+    $callid = $fhinfo->{"callid"};
+    ($bytes =~ /^Recognized /) && ($loglevel = LOG_INFO);
+    ($::Loglevel >= $loglevel)
+      && logit ($loglevel, (defined ($callid) ?
+			    ("callid=[" . $callid . "] ") : "")
+		. "snd " . $bytes .
+		" to "  . describe_fh ($fhinfo->{"fh"}));
+
+    $bytes .= "\n";
+    send_bytes ($fhinfo, $bytes);
+};
+
+##  clear_play_and_rec ($fhinfo);
+##    -- Clears out all variables associated with the current
+##       play and rec session
+sub clear_play_and_rec
+{
+    my ($fhinfo) = shift (@_);
+    my ($callid);
+
+    $callid = $fhinfo->{"callid"};
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] dpal() Data Cleared");
+    };
+    delete $fhinfo->{"play_queued"};
+    delete $fhinfo->{"play_requested"};
+    delete $fhinfo->{"wait_requested"};
+    delete $fhinfo->{"recognize_requested"};
+    delete $fhinfo->{"record_requested"};
+    delete $fhinfo->{"got_dtmf"};
+    delete $fhinfo->{"rec_timeout"};
+    delete $fhinfo->{"rec_maxtime"};
+    delete $fhinfo->{"rec_dtmfterm"};
+    delete $fhinfo->{"record_tone"};
+    delete $fhinfo->{"rec_file"};
+    delete $fhinfo->{"timed_out"};
+    delete $fhinfo->{"got_termchar"};
+};
+
+##  $signals = active_signals ($fhinfo);
+##    -- Returns string of signal characters for all currently active grammars.
+##       Returns "" if no signals are currently requested in active grammars.
+sub active_signals
+{
+    my ($fhinfo) = shift (@_);
+    my ($signals, $input, @active_gramids, @active_rules);
+    my ($match, $interp, $rule);
+
+    ##  See if cached value is available
+    defined ($signals = $fhinfo->{"gram_signals"}) && return $signals;
+
+    ##  Have to compute new signals
+    @active_gramids = grep ($fhinfo->{"gram_ids"}{$_}{"active"} == 1,
+			    keys (%{$fhinfo->{"gram_ids"}}));
+    @active_rules = map ($fhinfo->{"gram_ids"}{$_}{"rule"},
+			 @active_gramids);
+    $signals = "";
+    foreach $input ("h", "m", "t")
+    {
+	($match, $interp, $rule) =
+	  SRGSDTMF::check_rules_match ($input, @active_rules);
+	if ($match >= 0)
+	{
+	    $signals .= $input;
+	};
+    };
+    $fhinfo->{"gram_signals"} = $signals;
+    return $signals;
+}
+
+##  get_one_digit ($fhinfo, $timeout)
+##    --  Initiates a single-digit get from the Satc server.
+##        Uses $timeout as ms timeout.
+sub get_one_digit
+{
+    my ($fhinfo) = shift (@_);
+    my ($timeout) = shift (@_);
+    my ($callid) = $fhinfo->{"callid"};
+    my ($active_signals) = active_signals ($fhinfo);
+    my ($satc_command);
+
+    $satc_command = {Satc::MSGTYPE => Satc::GETDIG,
+		     Satc::CALLID => $callid,
+		     Satc::TIMEOUT => $timeout,
+		     Satc::STOPKEYS => "0123456789*#" . $active_signals,
+		     Satc::MAX_DIG => 1};
+    send_ct_client_msg ($::CTSrvInfo, $satc_command);
+};
+
+##  do_prompt_and_listen ($fhinfo)
+##    -- Given VXML filehandle structure $fhinfo,
+##       attempts to start or continue playing prompts, recognizing,
+##       recording, and/or transferring based on the contents
+##	 of the channel variables.
+sub do_prompt_and_listen
+{
+    my ($fhinfo) = shift (@_);
+    my ($callid, $queue, $satc_command, $index, $total, $status);
+    my ($file, $digits, @active_gramids, @active_rules);
+    my ($match, $interp, $rule, $nlsml, $gram_id, $rec_format, @gram_ids);
+    my ($could_queue_more, $bargein_for_batch, @filelist);
+    my ($queueitem, $type, $dtmfstring, $url, $xfer_type, $xfer_from);
+    my ($xfer_timeout, $flag);
+
+    $callid = $fhinfo->{"callid"};
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] dpal(): do_prompt_and_listen() called");
+    };
+
+    ##  See if telephony is disconnected, in which
+    ##  case there is no point in continuing here.
+    if (! defined ($fhinfo->{"connected"}))
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): disconnected, returning");
+	};
+	return;
+    };
+
+    ##  See if something is already happening on telphony, in which
+    ##  case there is no point in continuing here.
+    if (defined ($fhinfo->{"satc_doing"}))
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): satc_doing " .
+		   $::Satc->describe_msgtype ($fhinfo->{"satc_doing"}) .
+		   ", returning");
+	};
+	return;
+    };
+
+    ##  See if timeout with no input
+    if ((defined ($fhinfo->{"timed_out"})) &&
+	(! defined ($fhinfo->{"got_dtmf"})))
+    {
+	##  Empty input timeout
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): empty input timeout, returning NOINPUT");
+	};
+	clear_play_and_rec ($fhinfo);
+	send_vxml_interp_msg ($fhinfo, join (" ",
+					     "Recognized",
+					     VXIrec_RESULT_SUCCESS,
+					     NLSML_NOINPUT));
+	return;
+    };
+
+    ##  If keys have started to be pressed, see if we need to
+    ##  continue, or if a match has been found to a DTMF grammar.
+    if (defined ($fhinfo->{"got_dtmf"}))
+    {
+	##  Check the input against all DTMF grammars
+	$digits = $fhinfo->{"got_dtmf"};
+	@active_gramids = grep ($fhinfo->{"gram_ids"}{$_}{"active"} == 1,
+				keys (%{$fhinfo->{"gram_ids"}}));
+	@active_rules = map ($fhinfo->{"gram_ids"}{$_}{"rule"},
+			     @active_gramids);
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): DTMFs received = \"" .
+		   $digits .
+		   "\", trying to match against " .
+		   scalar (@active_rules) .
+		   " active grammar(s)");
+	};
+	($match, $interp, $rule) =
+	  SRGSDTMF::check_rules_match ($digits, @active_rules);
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): check_rules_match returns " .
+		   $match . " = " .
+		   (($match == -1) ? "failed match"
+		    : ($match == 0) ? "partial match"
+		    : ($match == 1) ? "full match with more match possible"
+		    : ($match == 2) ? "full match with no further possible"
+		    : "unknown"));
+	};
+
+	if (
+	    (($match == 2) && (($fhinfo->{"termtimeout"} == 0) ||
+			       (length ($fhinfo->{"terchar"}) == 0) ||
+			       defined ($fhinfo->{"timed_out"}) ||
+			       defined ($fhinfo->{"got_termchar"})))
+	     ||
+	    (($match == 1) && (defined ($fhinfo->{"timed_out"}) ||
+			       defined ($fhinfo->{"got_termchar"})))
+	   )
+	{
+	    ##  Return a match, so stop prompt/rec and return the result
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] dpal(): DTMFs matched, sending result");
+	    };
+
+	    clear_play_and_rec ($fhinfo);
+	    @gram_ids = keys(%{$fhinfo->{"gram_texts"}{$rule->{"text"}}});
+	    @gram_ids = grep ($fhinfo->{"gram_ids"}{$_}{"active"}, @gram_ids);
+	    $gram_id = $gram_ids[0];
+	    defined ($interp) || ($interp = "");
+	    $nlsml = "<?xml version=\'1.0\'?> <result> <interpretation grammar=\"$gram_id\" confidence=\"100\"> <input mode=\"dtmf\">$digits</input> <instance>$interp</instance> </interpretation> </result>";
+	    send_vxml_interp_msg ($fhinfo, join (" ",
+						 "Recognized",
+						 VXIrec_RESULT_SUCCESS,
+						 $nlsml));
+	    return;
+	}
+	elsif ($match == 2)
+	{
+	    ##  Have to wait for termchar
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] dpal(): DTMFs awaiting termchar");
+	    };
+	    get_one_digit ($fhinfo, $fhinfo->{"termtimeout"});
+	    return;
+	}
+	elsif (defined ($fhinfo->{"timed_out"}) ||
+	       defined ($fhinfo->{"got_termchar"}) ||
+	       ($match == -1))
+	{
+	    ##  Failed match
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] dpal(): DTMFs failed match, sending result");
+	    };
+
+	    clear_play_and_rec ($fhinfo);
+	    send_vxml_interp_msg ($fhinfo, join (" ",
+						 "Recognized",
+						 VXIrec_RESULT_SUCCESS,
+						 NLSML_NOMATCH));
+	    return;
+	}
+	else
+	{
+	    ##  No match yet, so keep listening for digits
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] dpal(): DTMFs getting further input");
+	    };
+	    get_one_digit ($fhinfo, $fhinfo->{"interdigittimeout"});
+	    return;
+	};
+    };
+
+
+    ##  Determine if there are any prompts to start playing
+    if (defined ($fhinfo->{"play_requested"}))
+    {
+	##  Check down the list of prompts to play
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): Checking for prompts");
+	};
+	undef $bargein_for_batch;
+	@filelist = ();
+	if (defined ($queue = $fhinfo->{"play_queued"}) &&
+	    ($total = scalar (@$queue)))
+	{
+	    $could_queue_more = 1;
+	    $index = -1;
+	    while ($could_queue_more && (++$index < $total))
+	    {
+		$queueitem = $queue->[$index];
+		$status = $queueitem->{"status"};
+		$type = $queueitem->{"type"};
+		if (($type eq "dtmf") && ($status == 1))
+		{
+		    ##  Can always play DTMFs at beginning of queue,
+		    ##  but can't combine them with audio.
+		    if (! scalar (@filelist))
+		    {
+			##  Play these DTMFs now
+			$dtmfstring = $queueitem->{"path"};
+			$queueitem->{"status"} = 2;
+		    }
+		    ##  Can't proceed further as DTMFs don't mix with audio
+		    $could_queue_more = 0;
+		}
+		elsif ($status == 0)
+		{
+		    ##  Can't proceed further - awaiting httpcache creation
+		    $could_queue_more = 0;
+		}
+		elsif ($status == 1)
+		{
+		    ##  Make sure the bargein setting doesn't conflict
+		    ##  with the prompts already in the list
+		    if ((! defined ($bargein_for_batch)) ||
+			($bargein_for_batch == $queueitem->{"bargein"}))
+		    {
+			##  Queue it up
+			push (@filelist, $queueitem->{"path"});
+			$bargein_for_batch = $queueitem->{"bargein"};
+			$queueitem->{"status"} = 2;
+		    }
+		    else
+		    {
+			##  Can't mix bargein and non-bargein, must wait
+			$could_queue_more = 0;
+		    };
+		};
+	    };
+
+	    ##  Play DTMFs or audio if they're ready
+	    if (defined ($dtmfstring))
+	    {
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "callid=[" . $callid .
+			   "] dpal(): Found DTMFs to play, playing");
+		};
+		if ($index == $total)
+		{
+		    ##  Got to the end of the list, so done playing
+		    ##  as soon as these play
+		    delete $fhinfo->{"play_requested"};
+		    delete $fhinfo->{"play_queued"};
+		};
+		$satc_command = {Satc::MSGTYPE => Satc::PLAYDIG,
+				 Satc::CALLID => $callid,
+				 Satc::DIGITS => $dtmfstring};
+		send_ct_client_msg ($::CTSrvInfo, $satc_command);
+		return;
+	    }
+	    elsif (scalar (@filelist))
+	    {
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "callid=[" . $callid .
+			   "] dpal(): Found prompts to play, playing");
+		};
+		if ($index == $total)
+		{
+		    ##  Got to the end of the list, so done playing
+		    ##  as soon as these play
+		    delete $fhinfo->{"play_requested"};
+		    delete $fhinfo->{"play_queued"};
+		};
+		$satc_command = {Satc::MSGTYPE => Satc::PLAY,
+				 Satc::CALLID => $callid,
+				 Satc::FILES => [ @filelist ],
+				 Satc::STOPKEYS =>
+				 ($bargein_for_batch ?
+				  "0123456789*#" . active_signals ($fhinfo)
+				  : "")};
+		send_ct_client_msg ($::CTSrvInfo, $satc_command);
+		return;
+	    };
+
+	    ##  See if we got to the end of the list
+	    if ($index != $total)
+	    {
+		##  Didn't get to the end of the list, so keep waiting
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "callid=[" . $callid .
+			   "] dpal(): No prompts ready, waiting for more");
+		};
+		return;
+	    }
+	    else
+	    {
+		##  Got to end of list, so no more to play
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "callid=[" . $callid .
+			   "] dpal(): Done with prompts");
+		};
+		delete $fhinfo->{"play_queued"};
+		delete $fhinfo->{"play_requested"};
+	    };
+	}
+	else
+	{
+	    ##  No prompts to play
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] dpal(): Done with prompts");
+	    };
+	    delete $fhinfo->{"play_queued"};
+	    delete $fhinfo->{"play_requested"};
+	};
+    };
+
+    ##  No more prompts to process, so let's see if this was a wait
+    if (defined ($fhinfo->{"wait_requested"}))
+    {
+	##  A wait was requested, so return a result
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): Sending response to wait");
+	};
+	clear_play_and_rec ($fhinfo);
+	##  Respond immediately
+	send_vxml_interp_msg ($fhinfo, "Waited");
+	return;
+    };
+
+    ##  No more prompts or wait, so let's see about a rec
+    if (defined ($fhinfo->{"recognize_requested"}))
+    {
+	##  Have to do a recognition
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): Starting recognition");
+	};
+	get_one_digit ($fhinfo, $fhinfo->{"rec_timeout"});
+	return;
+    };
+
+    ##  No more prompts or wait or recognition, so let's see about a record
+    if (defined ($fhinfo->{"record_requested"}))
+    {
+	##  Have to do a record
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): Starting record");
+	};
+	$rec_format = (($fhinfo->{"rec_type"} =~ /alaw/) ? "alaw" : "ulaw");
+	$file = join ("/", $::AstSoundPrefix, "rec",
+		      join ("_", $$, $callid, "rec")) . "." . $rec_format;
+	$fhinfo->{"rec_file"} = join ("/", $::VgCacheDir, "rec",
+				      join ("_", $$, $callid, "rec")) .
+					"." . $rec_format;
+	$satc_command =
+	{Satc::MSGTYPE => Satc::RECORD,
+	 Satc::CALLID => $callid,
+	 Satc::FILE => $file,
+	 Satc::START_TONE => ($fhinfo->{"record_tone"} ? "tone" : "notone"),
+	 Satc::TIMEOUT => $fhinfo->{"rec_finalsilence"},
+	 Satc::MAX_TIME => $fhinfo->{"rec_maxtime"},
+	 Satc::STOPKEYS => ($fhinfo->{"rec_dtmfterm"} ?
+			    "0123456789*#" . active_signals ($fhinfo) : ""),
+	 Satc::MIX => "inbound"};
+	send_ct_client_msg ($::CTSrvInfo, $satc_command);
+	return;
+    };
+
+    ##  No more prompts, wait, recognition, or record, so see about a transfer
+    if (defined ($url = $fhinfo->{"transfer_requested"}))
+    {
+	##  Have to do a transfer
+	$xfer_type = $fhinfo->{"xfer_type"};
+	$xfer_from = $fhinfo->{"xfer_from"};
+	$xfer_timeout = $fhinfo->{"xfer_timeout"};
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid .
+		   "] dpal(): Starting \"" . $xfer_type .
+		   "\" transfer to \"" . $url .
+		   "\" from \"" . $xfer_from .
+		   "\" timeout=" . $xfer_timeout);
+	};
+
+	##  Generate the transfer command
+	if ($url =~ /^sip:/i)
+	{
+	    $url =~ s/^sip:/sip\//i;
+	}
+	elsif ($url !~ /^[a-zA-Z]\//)
+	{
+	    $url = "sip/" . $url;
+	};
+	if ($xfer_type =~ /^br/i)
+	{
+	    $flag = 2;
+	}
+	elsif ($::Blind_transfer_method eq "transfer")
+	{
+	    $flag = 1;
+	}
+	else
+	{
+	    $flag = 0;
+	};
+	$satc_command = {Satc::MSGTYPE => Satc::TRANSFER,
+			 Satc::CALLID => $callid,
+			 Satc::URL => $url,
+			 Satc::FLAG => $flag,
+			 Satc::FROM => $xfer_from,
+			 Satc::TIMEOUT => $xfer_timeout};
+
+	##  Start the transfer
+	send_ct_client_msg ($::CTSrvInfo, $satc_command);
+
+	return;
+    };
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] dpal(): Nothing found to do");
+    };
+};
+
+##  ($ok, $msg, $xlation) = translate_builtin ($builtin_grammar)
+##    -- Returns $xlation the translation of a builtin grammar.
+sub translate_builtin
+{
+    my ($builtin_grammar) = shift (@_);
+    my ($base, $remainder, $gram_args, @arg_items);
+    my ($min, $max, $arg, $value, $xlation, $var_start, $var_end);
+
+    $gram_args = {};
+    if ($builtin_grammar =~ /^([^\?]+)\?(.+)$/)
+    {
+	$base = $1;
+	$remainder = $2;
+	@arg_items = split (/;/, $remainder);
+	foreach $remainder (@arg_items)
+	{
+	    if ($remainder =~ /^([^=]+)=(.+)$/)
+	    {
+		$gram_args->{$1} = $2;
+	    }
+	    else
+	    {
+		return (0, "Bad argument \"" . $remainder . "\"");
+	    };
+	};
+    }
+    else
+    {
+	$base = $builtin_grammar;
+    };
+
+    if ($base eq "digits")
+    {
+	##  Check arguments
+	foreach $arg (keys (%$gram_args))
+	{
+	    $value = $gram_args->{$arg};
+	    if ($arg eq "length")
+	    {
+		($value =~ /^\d+$/)
+		  || return (0, "Bad length parameter");
+		((defined ($min) && ($min != $value)) ||
+		 (defined ($max) && ($max != $value)))
+		  && return (0, "Conflicting length parameters");
+		$min = $value;
+		$max = $value;
+	    }
+	    elsif ($arg eq "minlength")
+	    {
+		($value =~ /^\d+$/)
+		  || return (0, "Bad minlength parameter");
+		(defined ($min) && ($min != $value))
+		  && return (0, "Conflicting length parameters");
+		$min = $value
+	    }
+	    elsif ($arg eq "maxlength")
+	    {
+		($value =~ /^\d+$/)
+		  || return (0, "Bad maxlength parameter");
+		(defined ($max) && ($max != $value))
+		  && return (0, "Conflicting length parameters");
+		$max = $value;
+	    };
+	};
+	defined ($min) && defined ($max) && ($min > $max)
+	  && return (0, "Conflicting length parameters");
+
+	##  Generate the translation
+	defined ($min) || defined ($max) || ($min = 1);
+	defined ($min) || ($min = "1");
+	defined ($max) || ($max = "30000");
+	$var_start = "<item repeat=\"$min-$max\">";
+	$var_end = "</item>";
+	$xlation = "<rule id=\"digit\" scope=\"public\">
+ $var_start
+  <one-of>
+    <item> 0 </item>
+    <item> 1 </item>
+    <item> 2 </item>
+    <item> 3 </item>
+    <item> 4 </item>
+    <item> 5 </item>
+    <item> 6 </item>
+    <item> 7 </item>
+    <item> 8 </item>
+    <item> 9 </item>
+  </one-of>
+ $var_end
+ <one-of>
+   <item> # </item>
+   <item/>
+ </one-of>
+</rule>
+";
+	return (1, "", $xlation);
+    }
+    else
+    {
+	return (0, "Builtin \"$base\" not supported");
+    };
+};
+
+##  ($ok, $msg, $xlation) = translate_choice ($grammar_text);
+##    -- Returns $xlation the translation of a choice grammar.
+sub translate_choice
+{
+    my ($grammar_text) = shift (@_);
+    my ($xlation, $item, $items_found, @items);
+
+    ##  Generate the translation
+    @items = split (//, $grammar_text);
+    $items_found = 0;
+    $xlation = "<rule id=\"$grammar_text\" scope=\"public\">\n";
+    foreach $item (@items)
+    {
+	if ($item !~ /^\s*$/)
+	{
+	    ++ $items_found;
+	    $xlation .= "  <item> $item </item>\n"
+	};
+    };
+    $xlation .= "</rule>\n";
+    if (! $items_found)
+    {
+	return (0, "No items found in choice grammar \"$grammar_text\"");
+    };
+    return (1, "", $xlation);
+};
+
+##  handle_ovxi_play ($fh_spec, $ovximsg)
+##    -- Handles "play" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_play
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+
+    $fhinfo->{"play_requested"} = 1;
+    ##  Don't actually start the play.
+    ##  The actual play will start on a subsequent
+    ##  recognize, record, or wait message.
+    send_vxml_interp_msg ($fhinfo, "Played");
+};
+
+##  handle_ovxi_wait ($fh_spec, $ovximsg)
+##    -- Handles "wait" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_wait
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $cmd);
+
+    $callid = $fhinfo->{"callid"};
+    if (! defined ($fhinfo->{"connected"}))
+    {
+	send_vxml_interp_msg ($fhinfo, "Waited");
+	return;
+    };
+
+    ##  If a play has been requested and there are files to
+    ##  play, we have to play them (no bargein assumed)
+    ##  Update vxml_doing
+    if ((defined ($fhinfo->{"play_requested"})) &&
+	(defined ($fhinfo->{"play_queued"})))
+    {
+	$fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
+	$fhinfo->{"wait_requested"} = 1;
+	do_prompt_and_listen ($fhinfo);
+    }
+    else
+    {
+	##  Return immediately
+	send_vxml_interp_msg ($fhinfo, "Waited");
+	return;
+    };
+};
+
+##  handle_ovxi_builtin ($fh_spec, $ovximsg)
+##    -- Handles "builtin" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_builtin
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $grammar, $length, $min_length, $max_length);
+
+    $callid = $fhinfo->{"callid"};
+    $grammar = $ovximsg->{"grammar"};
+
+    ##  There are two types of translation:
+    ##    Fixed-length digits:  "builtin:.../digits?length=XX"
+    ##      translate to: "00XX"
+    ##    Var-length digits:  "builtin:.../digits?minlength=XX&maxlength=YY"
+    ##                   or:  "builtin:.../digits?maxlength=YY"
+    ##      translate to: "00XXm0YY"
+
+    if ($grammar =~ /^builtin:[^\/]*\/digits\?length=(\d+)$/)
+    {
+	##  Fixed-length digit string
+	$length = $1;
+	$grammar = "00$length";
+    }
+    elsif ($grammar =~ /^builtin:[^\/]*\/digits\?minlength=(\d+).*maxlength=(\d+)$/)
+    {
+	##  Var-length digit string
+	$min_length = $1;
+	$max_length = $2;
+	$grammar = join ("m", "00$min_length", "0$max_length");
+    }
+    elsif ($grammar =~ /^builtin:[^\/]*\/digits\?maxlength=(\d+)$/)
+    {
+	##  Var-length digit string
+	$min_length = 0;
+	$max_length = $1;
+	$grammar = join ("m", "0$min_length", "0$max_length");
+    }
+    else
+    {
+	($::Loglevel >= LOG_WARN)
+	  && logit (LOG_WARN, "callid=[" . $callid .
+		    "] has unrecognized builtin grammar \"" .
+		    $grammar .
+		    "\", assuming generic #-termination");
+	$grammar = "001m032";
+    };
+    send_vxml_interp_msg ($fhinfo, join (" ", "Grammar", $grammar));
+}
+
+##  handle_ovxi_getlinestatus ($fh_spec, $ovximsg)
+##    -- Handles "GetLineStatus" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_getlinestatus
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($status);
+
+    $status = (defined ($fhinfo->{"connected"}) ? 1 : 0);
+    send_vxml_interp_msg ($fhinfo, "LineStatus " . $status);
+}
+
+##  handle_ovxi_disconnect ($fh_spec, $ovximsg)
+##    -- Handles "Disconnect" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_disconnect
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid);
+
+    $callid = $fhinfo->{"callid"};
+    (defined ($fhinfo->{"connected"})) || return;
+    ($::Loglevel >= LOG_NOTI)
+      && logit (LOG_NOTI, "callid=[" . $callid .
+		"] hanging up on request from VXML interp");
+    send_ct_client_msg
+      ($::CTSrvInfo, {Satc::MSGTYPE => Satc::HANGUP, Satc::CALLID => $callid});
+    delete $fhinfo->{"connected"};
+}
+
+##  handle_ovxi_queue ($fh_spec, $ovximsg)
+##    -- Handles "queue" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_queue
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $speak_spec, $ok, $msg, $files, $spoken_texts, $filelist);
+    my ($i, $file, $speak_list, $spec, $request_id, $hc_request, $hc_options);
+    my (@hc_request_items, @hc_request_options);
+    my ($index, $hc_cookies);
+    my ($bargein_spec, $bargein_value, $dtmfstring);
+
+    $callid = $fhinfo->{"callid"};
+
+    ##  Parse out the SSML
+    $speak_spec = $ovximsg->{"speak_spec"};
+    if (! (($ok, $msg, $speak_list)
+	   = parse_speak_xml ($speak_spec))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "callid=[" . $callid .
+		    "] has bad speak/audio XML in " .
+		    $speak_spec .
+		    ": " . $msg);
+	return;
+    };
+
+    ##  Parse out the bargein setting
+    $bargein_spec = $ovximsg->{"bargein"};
+    $bargein_value = 1;
+    if ($bargein_spec eq "false") {$bargein_value = 0;};
+
+    $hc_cookies = $fhinfo->{"cookie_file"};
+
+    ##  Process each SSML audio item
+    foreach $spec (@$speak_list)
+    {
+	##  Convert item into a http cache request unless it's DTMF to play
+	$request_id = $::Next_hcrequest_id;
+	(++$::Next_hcrequest_id >= 10000) && ($::Next_hcrequest_id = 1000);
+	@hc_request_options = ("a");
+	if (defined ($spec->{"tts"}) && defined ($spec->{"url"}))
+	{
+	    ##  Is a url with a tts fallback
+	    push (@hc_request_options, "f");
+	};
+	if (defined ($spec->{"timeout"}))
+	{
+	    push (@hc_request_options, "t=" . $spec->{"timeout"});
+	};
+	if (defined ($spec->{"maxage"}))
+	{
+	    push (@hc_request_options, "age=" . $spec->{"maxage"});
+	};
+	if (defined ($spec->{"lang"}))
+	{
+	    push (@hc_request_options, "lang=" . $spec->{"lang"});
+	};
+	$hc_options = join (":", @hc_request_options);
+
+	##  Check for DTMF play request
+	if (defined ($spec->{"tts"}) && (! defined ($spec->{"url"})) &&
+	    ($spec->{"tts"} =~ /^DTMF-([0-9#*]+)$/))
+	{
+	    $dtmfstring = $1;
+
+	    ##  Don't make httpcache request for DTMF plays, place
+	    ##  them in the "play_queued" array as status=1 (ready to play)
+	    if (! defined ($fhinfo->{"play_queued"}))
+	    {
+		$fhinfo->{"play_queued"} = [];
+	    };
+	    $index = scalar (@{$fhinfo->{"play_queued"}});
+	    push (@{$fhinfo->{"play_queued"}}, {"status" => 1,
+						"type" => "dtmf",
+						"path" => $dtmfstring});
+
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] Queued DTMF-play of \"" .
+		       $dtmfstring .
+		       " play_queued index $index");
+	    };
+	}
+	else
+	{
+	    ##  Make httpcache requests for audio plays
+	    @hc_request_items = ();
+	    push (@hc_request_items,
+		  "req",
+		  $request_id,
+		  $hc_options,
+		  $hc_cookies,
+		  "get",
+		  "-");
+	    if (defined ($spec->{"url"}))
+	    {
+		push (@hc_request_items,
+		      "url", clean_url_path($spec->{"url"}));
+	    };
+	    if (defined ($spec->{"tts"}))
+	    {
+		push (@hc_request_items,
+		      "tts", $spec->{"tts"});
+	    };
+	    $hc_request = join (" ", @hc_request_items);
+
+	    ##  put the prompt spec in the play_queued array.
+	    if (! defined ($fhinfo->{"play_queued"}))
+	    {
+		$fhinfo->{"play_queued"} = [];
+	    };
+	    $index = scalar (@{$fhinfo->{"play_queued"}});
+	    push (@{$fhinfo->{"play_queued"}}, {"status" => 0,
+						"type" => "audio",
+						"request_id" => $request_id,
+						"bargein" => $bargein_value});
+
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "callid=[" . $callid .
+		       "] made http cache request hcreq=[" .
+		       $request_id .
+		       "] for bargein=" . $bargein_value .
+		       " play_queued index $index as: " .
+		       $hc_request);
+	    };
+
+	    ##  Send out the http cache request
+	    send_bytes ($::HC_fhinfo, $hc_request . "\n");
+
+	    ##  and record the request to it
+	    $::HC_request_id_info->{$request_id} =
+	    {"vxml_fh" => $fhinfo->{"fh"},
+	     "type" => "a",
+	     "index" => $index};
+	};
+    };
+};
+
+##  handle_ovxi_httpget ($fh_spec, $ovximsg)
+##    -- Handles "httpget" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_httpget
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $ok, $msg, $url, $method, $postdata, $parsevxml);
+    my ($request_id, $hc_request, $hc_options);
+    my (@hc_request_items, @hc_request_options);
+    my ($index, $hc_cookies);
+    my ($bargein_spec, $bargein_value, $dtmfstring);
+
+    $callid = $fhinfo->{"callid"};
+    $method = $ovximsg->{"method"};
+    $url = $ovximsg->{"url"};
+    $postdata = $ovximsg->{"postdata"};
+    $parsevxml = $ovximsg->{"parsevxml"};
+    $hc_cookies = $fhinfo->{"cookie_file"};
+
+    ##  Convert into a http cache request
+    $request_id = $::Next_hcrequest_id;
+    (++$::Next_hcrequest_id >= 10000) && ($::Next_hcrequest_id = 1000);
+    @hc_request_options = ($parsevxml ? "v" : "x");
+    $hc_options = join (":", @hc_request_options);
+
+    ##  Make httpcache request
+    @hc_request_items = ();
+    push (@hc_request_items,
+	  "req",
+	  $request_id,
+	  $hc_options,
+	  $hc_cookies,
+	  $method,
+	  (length ($postdata) ? $postdata : "-"),
+	  "url",
+	  clean_url_path($url));
+    $hc_request = join (" ", @hc_request_items);
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] made http cache request hcreq=[" .
+	       $request_id . "] for url=" . $url .
+	       " as: " . $hc_request);
+    };
+
+    ##  Send out the http cache request
+    send_bytes ($::HC_fhinfo, $hc_request . "\n");
+
+    ##  and record the request to it
+    $::HC_request_id_info->{$request_id} =
+    {"vxml_fh" => $fhinfo->{"fh"},
+     "type" => "v"};
+};
+
+##  handle_ovxi_vxmlparse ($fh_spec, $ovximsg)
+##    -- Handles "VXMLParse" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_vxmlparse
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $ok, $msg, $addr);
+    my ($request_id, $hc_request, $hc_options);
+    my (@hc_request_items, @hc_request_options);
+
+    $callid = $fhinfo->{"callid"};
+    $ok = $ovximsg->{"ok"};
+    $addr = $ovximsg->{"addr"};
+    if (! defined ($request_id = $fhinfo->{"htcache_req_id"}))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "callid=[" . $callid .
+		   "] No htcache_req_id relating to VXMLParse message");
+	};
+	return;
+    };
+    delete $fhinfo->{"htcache_req_id"};
+
+    ##  Convert into a message to http cache
+    $hc_request = join (" ", "parsed", $request_id, $addr) . "\n";
+
+    ##  Send out the http cache request
+    send_bytes ($::HC_fhinfo, $hc_request);
+};
+
+##  handle_ovxi_pcmqueue ($fh_spec, $ovximsg)
+##    -- Handles "pcmqueue" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_pcmqueue
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $path, $ast_path, $bargein_spec, $bargein_value);
+
+    $callid = $fhinfo->{"callid"};
+    $path = $ovximsg->{"path"};
+
+    ##  Parse out the bargein setting
+    $bargein_spec = $ovximsg->{"bargein"};
+    $bargein_value = 1;
+    if ($bargein_spec eq "false") {$bargein_value = 0;};
+
+    ##  Convert from local path to Asterisk path
+    if (substr ($path, 0, length ($::VgCacheDir)) eq $::VgCacheDir)
+    {
+	substr ($path, 0, length ($::VgCacheDir)) = $::AstSoundPrefix;
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "callid=[" . $callid .
+		   "] invalid PCMQueue path \"" .
+		   $path .
+		   "\", doesn't start with \"" .
+		   $::VgCacheDir . "\"");
+	};
+	return;
+    };
+
+    ##  put the promptspec in the play_queued array.
+    if (! defined ($fhinfo->{"play_queued"}))
+    {
+	$fhinfo->{"play_queued"} = [];
+    };
+    push (@{$fhinfo->{"play_queued"}}, {"status" => 1,
+					"type" => "audio",
+					"bargein" => $bargein_value,
+					"path" => $path});
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] queued bargein=" . $bargein_value . " PCM prompt " . $path);
+    };
+};
+
+##  handle_ovxi_recognize ($fh_spec, $ovximsg)
+##    -- Handles "recognize" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_recognize
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid);
+
+    $callid = $fhinfo->{"callid"};
+    if (! defined ($fhinfo->{"connected"}))
+    {
+	send_vxml_interp_msg ($fhinfo, "Recognized 0 " . NLSML_NOINPUT);
+	return;
+    };
+
+    ##  Extract recognition parameters
+    defined ($fhinfo->{"rec_timeout"} =
+	     parse_vxml_timeval ($ovximsg->{"properties"}{"timeout"}))
+      || ($fhinfo->{"rec_timeout"} = 7000);
+    defined ($fhinfo->{"interdigittimeout"} =
+	     parse_vxml_timeval($ovximsg->{"properties"}{"interdigittimeout"}))
+      || ($fhinfo->{"interdigittimeout"} = 7000);
+    defined ($fhinfo->{"termtimeout"} =
+	     parse_vxml_timeval($ovximsg->{"properties"}{"termtimeout"}))
+      || ($fhinfo->{"termtimeout"} = 0);
+    defined ($fhinfo->{"termchar"} = $ovximsg->{"properties"}{"termchar"})
+      || ($fhinfo->{"termchar"} = "");
+
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, "callid=[" . $callid .
+		"] doing recognition with timeout=" .
+		$fhinfo->{"rec_timeout"});
+
+    $fhinfo->{"play_requested"} = 1;
+    $fhinfo->{"recognize_requested"} = 1;
+    $fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
+    do_prompt_and_listen ($fhinfo);
+};
+
+##  handle_ovxi_transfer ($fh_spec, $ovximsg)
+##    -- Handles "Transfer" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_transfer
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid, $url, $satc_command, $timeout);
+
+    $callid = $fhinfo->{"callid"};
+    if (! defined ($fhinfo->{"connected"}))
+    {
+	send_vxml_interp_msg ($fhinfo, "Transfered");
+	return;
+    };
+    $timeout = $ovximsg->{"timeout"};
+    if ($timeout eq "") {$timeout = 0;};
+
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, "callid=[" . $callid .
+		"] queueing transfer to url=" .
+		$ovximsg->{"url"});
+    $fhinfo->{"transfer_requested"} = $ovximsg->{"url"};
+    $fhinfo->{"xfer_type"} = $ovximsg->{"xfer_type"};
+    $fhinfo->{"xfer_from"} = $ovximsg->{"from"};
+    $fhinfo->{"xfer_timeout"} = $timeout;
+    $fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
+    $fhinfo->{"play_requested"} = 1;
+    do_prompt_and_listen ($fhinfo);
+};
+
+##  handle_ovxi_record ($fh_spec, $ovximsg)
+##    -- Handles "Record" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_record
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($ok, $msg, $callid);
+
+    $callid = $fhinfo->{"callid"};
+    if (! defined ($fhinfo->{"connected"}))
+    {
+	send_vxml_interp_msg ($fhinfo, "Recorded " . VXIrec_RESULT_FAILURE);
+	return;
+    };
+
+    defined ($fhinfo->{"record_tone"} =
+	     parse_vxml_bool ($ovximsg->{"properties"}{"beep"}))
+      || ($fhinfo->{"record_tone"} = 1);
+    defined ($fhinfo->{"rec_maxtime"} =
+	     parse_vxml_timeval ($ovximsg->{"properties"}{"maxtime"}))
+      || ($fhinfo->{"rec_maxtime"} = 600000);
+    defined ($fhinfo->{"rec_finalsilence"} =
+	     parse_vxml_timeval ($ovximsg->{"properties"}{"finalsilence"}))
+      || ($fhinfo->{"rec_finalsilence"} = 5000);
+    defined ($fhinfo->{"rec_type"} = $ovximsg->{"properties"}{"rectype"})
+      && length ($fhinfo->{"rec_type"})
+	|| ($fhinfo->{"rec_type"} = "audio/basic");
+    defined ($fhinfo->{"rec_dtmfterm"} =
+	     parse_vxml_bool ($ovximsg->{"properties"}{"dtmfterm"}))
+      || ($fhinfo->{"rec_dtmfterm"} = 1);
+    $fhinfo->{"play_requested"} = 1;
+    $fhinfo->{"record_requested"} = 1;
+    $fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
+    do_prompt_and_listen ($fhinfo);
+};
+
+##    -- Handles grammar free messages
+##       in $ovximsg from OVXI for VXML
+##       interpreter specified by $fhinfo
+sub handle_ovxi_freegrammar
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($gram_id) = $ovximsg->{"gram_id"};
+    my ($gram);
+
+    $gram = $fhinfo->{"gram_ids"}{$gram_id}{"rule"};
+
+    delete $fhinfo->{"gram_texts"}{$gram->{"text"}}{$gram_id};
+    delete $fhinfo->{"gram_ids"}{$gram_id};
+
+    send_vxml_interp_msg ($fhinfo, "0");
+}
+
+##  handle_ovxi_grammar_status ($fh_spec, $ovximsg)
+##    -- Handles grammar activation and deactivation messages
+##       in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_grammar_status
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($active_status) = shift (@_);
+    my ($callid) = $fhinfo->{"callid"};
+    my ($gram_id) = $ovximsg->{"gram_id"};
+    my ($msgtype) = $ovximsg->{"msgtype"};
+
+    ##  Check that the gram_id has been loaded
+    if (! defined $fhinfo->{"gram_ids"}{$gram_id})
+    {
+	##  Activation/Deactivation failure
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "callid=[" . $callid .
+		    "] cannot " . $::OVXITypeToOVXIMsg->{$msgtype} .
+		    ", unrecognized grammar id " .
+		    $gram_id);
+	send_vxml_interp_msg ($fhinfo, "1");
+	return;
+    };
+
+    ##  Activation/Deactivation success
+    $fhinfo->{"gram_ids"}{$gram_id}{"active"} =
+      (($msgtype == OVXI_ACTIVATEGRAMMAR) ? 1 : 0);
+    delete $fhinfo->{"gram_signals"};
+    ($::Loglevel >= LOG_DBUG)
+      && logit (LOG_DBUG, "callid=[" . $callid .
+		"] " . $::OVXITypeToOVXIMsg->{$msgtype} . " " .
+		$ovximsg->{"gram_id"} . " done");
+    send_vxml_interp_msg ($fhinfo, "0");
+};
+
+##  handle_ovxi_grammar ($fh_spec, $ovximsg)
+##    -- Handles "Grammar" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_grammar
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($ok, $msg, $rule, $modes, $builtin_grammar, $xlation);
+    my ($callid) = $fhinfo->{"callid"};
+    my ($grammar_text) = $ovximsg->{"grammar"};
+    my ($gram_id) = $ovximsg->{"gram_id"};
+    my ($gram_type) = $ovximsg->{"gram_type"};
+
+    ##  Check for mode and type
+    if (($gram_type ne "text/x-grammar-choice-dtmf") &&
+	($gram_type ne "application/srgs+xml"))
+    {
+	if ($grammar_text =~ /^builtin:[^\/]+\/(.*)$/)
+	{
+	    ##  a builtin grammar request, handled by SRGSDTMF
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, "callid=[" . $callid .
+			"] detected builtin grammar: " . $grammar_text);
+	}
+	elsif ($gram_type eq "text/x-grammar-choice")
+	{
+	    ##  OVXI shouldn't be passing these to me, so just
+	    ##  create a never-matching grammar.
+	    $grammar_text = "<rule id=\"nomatch\" scope=\"public\">
+  <item> Z </item>
+</rule>
+";
+	}
+	else
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR, "callid=[" . $callid .
+			"] invalid grammar type \"" .
+			$gram_type . "\"");
+	    send_vxml_interp_msg ($fhinfo, "Grammar 1");
+	    return;
+	};
+    };
+    if ((! defined ($modes = $ovximsg->{"properties"}{"inputmodes"})) ||
+	(($modes ne "dtmf") && (! $::Ignore_Inputmode_Errors)))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "callid=[" . $callid .
+		    "] invalid inputmodes \"" .
+		    $modes . "\", must be dtmf");
+	send_vxml_interp_msg ($fhinfo, "Grammar 1");
+	return;
+    };
+
+    ##  Convert choice grammars to SRGS grammars
+    if ($grammar_text =~ /^[ 0123456789\*\#]$/)
+    {
+	($ok, $msg, $xlation) = translate_choice ($grammar_text);
+	if (! $ok)
+	{
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR, "callid=[" . $callid .
+			"] invalid choice grammar \"" .
+			$grammar_text . "\": " . $msg);
+	    send_vxml_interp_msg ($fhinfo, "Grammar 1");
+	    return;
+	};
+	$grammar_text = $xlation;
+    };
+
+    ##  Parse this grammar if it hasn't already been parsed
+    if (! defined ($rule = $::Gram_text_to_rule->{$grammar_text}))
+    {
+	($ok, $msg, $rule) = SRGSDTMF::parse_srgsdtmf_grammar ($grammar_text);
+	if (! $ok)
+	{
+	    ##  Parse failure
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR, "callid=[" . $callid .
+			"] Unparseable grammar id " .
+			$gram_id . " : " . $msg .
+			" for " . $grammar_text);
+	    send_vxml_interp_msg ($fhinfo, "Grammar 1");
+	    return;
+	};
+
+	##  Parse success
+	$::Gram_text_to_rule->{$grammar_text} = $rule;
+	$rule->{"text"} = $grammar_text;
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid . "] New grammar id " .
+		   $gram_id . " parsed");
+	};
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "callid=[" . $callid . "] New grammar id " .
+		   $gram_id . " assigned to previous parse");
+	};
+    };
+    $fhinfo->{"gram_ids"}{$gram_id} = {"active" => 0,   ##  start out inactive
+				       "rule" => $rule};
+    $fhinfo->{"gram_texts"}{$grammar_text}{$gram_id} = 1;
+    send_vxml_interp_msg ($fhinfo, "Grammar 0");
+};
+
+##  handle_ovxi_getpcmpath ($fh_spec, $ovximsg)
+##    -- Handles "GetPCMPath" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_getpcmpath
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid) = $fhinfo->{"callid"};
+    my ($numeric_id, $path, $extension);
+
+    if ($ovximsg->{"pcm_id"} =~ /^x-vxiprompt-ref_internalName_(\d+)$/)
+    {
+	$numeric_id = $1;
+    };
+
+    if (! defined ($numeric_id))
+    {
+	($::Loglevel >= LOG_WARN)
+	  && logit (LOG_WARN, "callid=[" . $callid .
+		    "] invalid format of PCM id \"" .
+		    $ovximsg->{"pcm_id"});
+	$numeric_id = $ovximsg->{"pcm_id"};
+    };
+    $extension = (($ovximsg->{"pcm_type"} =~ /alaw/) ? "alaw" : "ulaw");
+    $path = join ("/", $::VgCacheDir, "rec",
+		  join ("_", $$, $callid, "prompt", $numeric_id)) .
+		    "." . $extension;
+
+    send_vxml_interp_msg ($fhinfo, join (" ", "PCMPath", $path));
+};
+
+##  handle_ovxi_exitval ($fh_spec, $ovximsg)
+##    -- Handles "exitval" message in $ovxi_msg from OVXI for VXML
+##       interpreter specified by $fh_spec
+sub handle_ovxi_exitval
+{
+    my ($fhinfo) = shift (@_);
+    my ($ovximsg) = shift (@_);
+    my ($callid) = $fhinfo->{"callid"};
+    my ($spec) = $ovximsg->{"varspec"};
+    my ($var, $value, $satc_command);
+
+    if ($spec =~ /^([^=]+)=(.*)$/)
+    {
+	$var = $1;
+	$value = $2;
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "callid=[" . $callid .
+		    "] invalid format of exitval varspec " . $spec);
+	return;
+    };
+
+    $satc_command = {Satc::MSGTYPE => Satc::RETURNVAR,
+		     Satc::CALLID => $callid,
+		     Satc::VAR => $var,
+		     Satc::VALUE => $value};
+
+    ##  Update vxml_doing
+    $fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
+
+    ##  Start the transfer
+    send_ct_client_msg ($::CTSrvInfo, $satc_command);
+};
+
+##  handle_vxilog_message ($message)
+##    -- Forwards log messages from VXI to generic log facility
+$::Last_VXI_log_level = LOG_DBUG;
+sub handle_vxilog_message
+{
+    my ($log_message) = shift (@_);
+    my ($level);
+
+    length ($log_message) || return;
+    $level = ord ($log_message);
+    if (($level < LOG_EMRG) || ($level > LOG_DBUG))
+    {
+	##  Did not get a valid message level
+	$level = $::Last_VXI_log_level;
+    }
+    else
+    {
+	##  Did get a valid message level
+	$::Last_VXI_log_level = $level;
+	substr ($log_message, 0, 1, "");
+    };
+    chomp ($log_message);
+
+    ##  Forward the log message
+    logit ($level, $log_message, $::Dynlog_VXImodule);
+};
+
+##  handle_httpcache_message ($message)
+##    -- Receives messages from the http cache
+sub handle_httpcache_message
+{
+    my ($hc_message) = shift (@_);
+    my ($request_id, $status, $req_spec, $vxml_fh);
+    my ($fhinfo, $queue_index, $queue, $id, $queue_item, $parse_tree_addr);
+    my ($msg_to_vxmlthread, $abspath, $astpath, $content_type);
+
+    chomp ($hc_message);
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "rcv sc: " . dump_bytes ($hc_message));
+    };
+
+    ##  Parse the message
+    if ($hc_message =~ /^done\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/s)
+    {
+	$request_id = $1;
+	$status = $2;
+	$abspath = $3;
+	$astpath = $4;
+	$content_type = $5;
+	$parse_tree_addr = $6;
+    }
+    elsif ($hc_message =~ /^free\s+(\S+)\s*$/s)
+    {
+	$parse_tree_addr = $1;
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "Freeing VXMLDocument " .
+		   $parse_tree_addr);
+	};
+	Vxglue::_voiceglue_vxmlparse_free ($parse_tree_addr);
+	return;
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unparseable msg from httpcache: " .
+		    dump_bytes ($hc_message));
+	return;
+    };
+
+    ##  Find this request
+    if (! defined ($req_spec = $::HC_request_id_info->{$request_id}))
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unrecognized http cache request id " .
+		    $request_id . " in " .
+		    dump_bytes ($hc_message));
+	return;
+    };
+    delete $::HC_request_id_info->{$request_id};
+
+    ##  See if the requesting thread still exists
+    $vxml_fh = $req_spec->{"vxml_fh"};
+    if (! defined ($fhinfo = $::Clients->{$vxml_fh}))
+    {
+	if ($status == 0)
+	{
+	    ##  Send failure to httpcache
+	    ($::Loglevel >= LOG_EROR)
+	      && logit (LOG_EROR, "hcreq=[" . $request_id .
+			"] lost its VXML thread, but needed parse");
+	    send_bytes ($::HC_fhinfo, "parsed " . $request_id . " -\n");
+	}
+	else
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, "hcreq=[" . $request_id .
+			"] lost its VXML thread, ignoring");
+	};
+	return;
+    };
+
+    ##  See whether it's an audio request
+    if ($req_spec->{"type"} eq "a")
+    {
+	##  See if the reuqesting thread still needs the audio item
+	if (! defined ($fhinfo->{"connected"}))
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, "callid=[" . $fhinfo->{"callid"} .
+		    "] " . "hcreq=[" . $request_id .
+			"] is for a disconnected call, ignoring");
+	    return;
+	};
+	$queue_index = $req_spec->{"index"};
+	if ((! defined ($queue = $fhinfo->{"play_queued"})) ||
+	    (scalar (@$queue) <= $queue_index) ||
+	    (! defined ($queue_item = $queue->[$queue_index])) ||
+	    (! defined ($id = $queue_item->{"request_id"})) ||
+	    ($id != $request_id))
+	{
+	    ($::Loglevel >= LOG_DBUG)
+	      && logit (LOG_DBUG, "callid=[" . $fhinfo->{"callid"} .
+			"] " ."hcreq=[" . $request_id .
+			"] no longer in play queue, ignoring");
+	    return;
+	};
+
+	if ($queue_item->{"status"} != 0)
+	{
+	    ($::Loglevel >= LOG_WARN)
+	      && logit (LOG_WARN, "callid=[" . $fhinfo->{"callid"} .
+			"] " ."hcreq=[" . $request_id .
+			"] queue item already has status=" .
+			$queue_item->{"status"} . ", ignoring");
+	    return;
+	};
+
+	##  Update the item
+	$queue_item->{"status"} = $status;
+	$queue_item->{"path"} = $astpath;
+	delete $queue_item->{"request_id"};
+
+	##  See if plays now need to start
+	do_prompt_and_listen ($fhinfo);
+    }
+    else
+    {
+	##  It's a non-audio cached item
+	##  Send the absolute path of the cached file back to openvxi
+	if ($status == -1)
+	{
+	    ##  Failure
+	    $msg_to_vxmlthread = "0";
+	}
+	else
+	{
+	    if ($status == 0)
+	    {
+		##  Need a parse
+		$fhinfo->{"htcache_req_id"} = $request_id;
+		$msg_to_vxmlthread = join (" ", $abspath, $content_type);
+	    }
+	    else
+	    {
+		$msg_to_vxmlthread = join (" ", $abspath, $content_type,
+					   $parse_tree_addr);
+	    };
+	}
+	send_vxml_interp_msg ($fhinfo, $msg_to_vxmlthread);
+    };
+};
+
+##  handle_msg_from_vxml_interp ($fh_spec, $bytes)
+##    -- Handles incoming message in $bytes from a VXML interpreter
+##       on filehandle with $::Clients entry $fh_spec
+sub handle_msg_from_vxml_interp
+{
+    my ($fhinfo) = shift (@_);
+    my ($bytes) = shift (@_);
+    my ($ovximsg, $callid, $msgtype);
+    my ($ok, $msg, $errmsg);
+
+    $callid = $fhinfo->{"callid"};
+
+    if (! $fhinfo->{"processing"})
+    {
+	$fhinfo->{"processing"} = 1;
+    };
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "callid=[" . $callid .
+	       "] rcv ovxi: " . dump_bytes ($bytes));
+    };
+
+    chop ($bytes);
+    (substr ($bytes, -1) eq "\r") && chop ($bytes);
+
+    ##  First, see if it is the empty message signifying end-of-thread
+    if (! length ($bytes))
+    {
+	##  Handle end-of-VXML-thread signal
+	($::Loglevel >= LOG_NOTI)
+	  && logit (LOG_NOTI, "callid=[" . $callid .
+		    "] VXML interpreter thread exited" .
+		    " =#[#= " . sprintf ("%.3f", systime()) .
+		    " call end " . $callid . " =#]#=");
+
+	##  This cleans up the C-side fh
+	clean_up_stopped_vxml_thread ($fhinfo->{"fh"});
+
+	##  Close the perl-side filehandle associated with the VXML thread
+	remove_client ($fhinfo->{"fh"});
+	$::Scom->unregister ($fhinfo->{"fh"});
+	return;
+    };
+
+    ##  First, parse it into its fields
+    if (! (($ok, $errmsg, $ovximsg) = parse_ovxi_msg ($fhinfo, $bytes))[0])
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, $errmsg . " from " .
+		    describe_fh ($fhinfo->{"fh"}) . " in msg " .
+		    dump_bytes ($bytes));
+	return;
+    };
+
+    $msgtype = $ovximsg->{"msgtype"};
+    if ($msgtype == OVXI_STARTED)
+    {
+	##  Just for debug for now
+	($::Loglevel >= LOG_DBUG)
+	  && logit (LOG_DBUG, "callid=[" . $callid .
+		    "] got msg: " .
+		    describe_ovxi_msg ($ovximsg) .
+		    " from " .
+		    describe_fh ($fhinfo->{"fh"}));
+
+	send_vxml_interp_msg ($fhinfo, "continue");
+    }
+    elsif (($msgtype == OVXI_ACTIVATEGRAMMAR) ||
+	   ($msgtype == OVXI_DEACTIVATEGRAMMAR))
+    {
+	handle_ovxi_grammar_status ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_RECOGNIZE)
+    {
+	handle_ovxi_recognize ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_QUEUE)
+    {
+	handle_ovxi_queue ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_HTTPGET)
+    {
+	handle_ovxi_httpget ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_VXMLPARSE)
+    {
+	handle_ovxi_vxmlparse ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_PLAY)
+    {
+	handle_ovxi_play ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_WAIT)
+    {
+	handle_ovxi_wait ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_BUILTIN)
+    {
+	handle_ovxi_builtin ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_GETLINESTATUS)
+    {
+	handle_ovxi_getlinestatus ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_DISCONNECT)
+    {
+	handle_ovxi_disconnect ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_TRANSFER)
+    {
+	handle_ovxi_transfer ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_RECORD)
+    {
+	handle_ovxi_record ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_GRAMMAR)
+    {
+	handle_ovxi_grammar ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_FREEGRAMMAR)
+    {
+	handle_ovxi_freegrammar ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_GETPCMPATH)
+    {
+	handle_ovxi_getpcmpath ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_PCMQUEUE)
+    {
+	handle_ovxi_pcmqueue ($fhinfo, $ovximsg);
+    }
+    elsif ($msgtype == OVXI_EXITVAL)
+    {
+	handle_ovxi_exitval ($fhinfo, $ovximsg);
+    }
+    else
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unsupported msg " .
+		    describe_ovxi_msg ($ovximsg) .
+		    " from " .
+		    describe_fh ($fhinfo->{"fh"}));
+    };
+};
+
+##  handle_command_message ($fh, $bytes)
+##    -- Handles message from command filehandle $fh in $bytes
+sub handle_command_message
+{
+    my ($fh) = shift;
+    my ($bytes) = shift;
+    my ($ok, $msg, $stopin_bytes);
+
+    chomp ($bytes);
+    if (($bytes eq "stop") ||
+	($bytes eq "exit") ||
+	($bytes eq "quit"))
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "Starting controlled voiceglue shutdown " .
+		   "on request from user command: " . $bytes);
+	};
+
+	##  Stop voiceglue processing when all current calls are done
+	(($ok, $msg, $stopin_bytes) =
+	 $::Satc->encode ({Satc::MSGTYPE => Satc::STOPIN}))[0]
+	   || logit (LOG_EROR, "Satc encode failure on Satc::STOPIN: $msg");
+	($ok, $msg) = $::Scom->write ($::CTSrvFh, $stopin_bytes);
+	if (! $ok)
+	{
+	    fh_stopped ($::CTSrvFh, $msg);
+	};
+	$::Stop_requested = 1;
+	($::VXML_threads == 0) && ($::Finished = 1);
+	($ok, $msg) = $::Scom->write ($fh, "Stopping voiceglue, currently " .
+				      $::VXML_threads .
+				      " VXML threads running\n");
+	if (! $ok)
+	{
+	    fh_stopped ($fh, $msg);
+	};
+    }
+    elsif ($bytes eq "memory")
+    {
+	$::Scom->write ($fh, "Memory use: \n");
+
+	$::Scom->write ($fh, "Clients: " .
+			scalar (keys (%$::Clients)) . "\n");
+	$::Scom->write ($fh, "Callid_to_vxml_fh: " .
+			scalar (keys (%$::Callid_to_vxml_fh)) . "\n");
+	$::Scom->write ($fh, "HC_request_id_info: " .
+			scalar (keys (%$::HC_request_id_info)) . "\n");
+	$::Scom->write ($fh, "Gram_text_to_rule: " .
+			scalar (keys (%$::Gram_text_to_rule)) . "\n");
+    }
+    else
+    {
+	($ok, $msg) = $::Scom->write ($fh, "Unrecognized command: $bytes\n");
+	if (! $ok)
+	{
+	    fh_stopped ($fh, $msg);
+	};
+    };
+};
+
+
+##  ($ok, $msg, $param_map) = parse_configfile();
+##    -- Checks if the URL file needs to be re-read,
+##       and does so if it needs it.
+##       Returns $ok of 1 on no-need-to-re-read, 2 on re-read, 0 on failure.
+##       $param_map is the map of parameters found in the file.
+sub parse_configfile
+{
+    my ($ok, $msg, $mtime, $conf_map, @statresult);
+    my ($param_map) = {};
+
+    ##  Check if the $::Conffile has been modified
+    defined ($::Conffile) || return (1, "", $param_map);
+    scalar (@statresult = stat ($::Conffile))
+      || return (0, "Cannot stat \"$::Conffile\": $!", $param_map);
+    defined ($::Conffile_last_mtime) || ($::Conffile_last_mtime = 0);
+    (($mtime = $statresult[9]) == $::Conffile_last_mtime)
+      && return (1, "", $param_map);
+
+    ##  $::Conffile has been modified, and must be re-parsed
+    $::Conffile_last_mtime = $mtime;
+    ($ok, $msg, $conf_map) =
+      Voiceglue::Conf::parse_voiceglue_conf ($::Conffile);
+    if (! $ok)
+    {
+	($::Loglevel >= LOG_WARN)
+	  && logit (LOG_WARN, "Errors when parsing " . $::Conffile .
+		    " : " . $msg);
+    };
+    $::URLmap = $conf_map->{"urls"};
+    $param_map = $conf_map->{"params"};
+
+    return (2, "", $param_map);
+};
+
+##  The size of the current file
+$::Current_log_file_size = 0;
+
+##  $bytes = get_next_bytes ($filehandle)
+##    Returns next bytes received from $filehandle, or undef on close
+sub get_next_bytes
+{
+    my ($filehandle) = shift (@_);
+    my ($datum, $bytes, $datumlist, @events);
+    my Cam::Scom::Event $event;
+    @events = $::Scom->getevents (-1, $filehandle);
+    while (defined ($datumlist = shift (@events)))
+    {
+	shift (@$datumlist);
+	while (defined ($datum = shift (@$datumlist)))
+	{
+	    if (ref ($datum))
+	    {
+		return undef;
+	    }
+	    else
+	    {
+		$bytes .= $datum;
+	    };
+	};
+    };
+    return $bytes;
+};
+
+##  initialize_log()
+##    -- Initializes logging.  If $::Loghost is defined, tries to
+##       use it as a dynlog host.
+sub initialize_log
+{
+    openlogfile (1);
+    (defined ($::Loghost)) && opendynlog();
+    $::Logging_enabled = 1;
+    log_new_day();
+};
+
+##  shutdown_log()
+##    -- Shuts down logging.
+sub shutdown_log
+{
+    my ($ok, $msg);
+
+    if (! $::Time_of_next_connect_to_log_server)
+    {
+	logtofile (LOG_INFO, "disconnecting from dynlog server",
+		   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+	($ok, $msg) = $::Scom->unregister ($::Log_fh);
+	if (! $ok)
+	{
+	    logtofile (LOG_INFO,
+		       "cannot disconnect from dynlog server : $msg",
+		       $::Dynlog_Mymodule, $::Dynlog_Mythread);
+	};
+	$::Time_of_next_connect_to_log_server = 1;
+    }
+};
+
+##  $hash = eight_byte_simplehash ($string)
+##    -- Returns a 16-character hex hash of $string
+sub eight_byte_simplehash
+{
+    my ($item) = shift (@_);
+    my ($hash_bucket, $char_num);
+    my (@hashnums) = (0, 0, 0, 0, 0, 0, 0, 0);
+    my (@path_chars) = split (//, $item);
+    for ($char_num = 0; $char_num < scalar(@path_chars); ++$char_num)
+    {
+	$hash_bucket = $char_num % 8;
+	$hashnums[$hash_bucket] += ord($path_chars[$char_num]);
+    };
+    return join ("", map (sprintf ("%02X", ($_ % 256)),  @hashnums));
+};
+
+##  $escaped_cookie = escape_cookie ($cookie)
+##    -- Returns $cookie escaped using cookie escaping rules,
+##       which includes eliminating "=", "#", and ":".
+sub escape_cookie
+{
+    my ($cookie) = shift (@_);
+    $cookie =~ s/%/%25/gs;
+    $cookie =~ s/\//%2F/gs;
+    $cookie =~ s/=/%3D/gs;
+    $cookie =~ s/#/%23/gs;
+    $cookie =~ s/:/%3A/gs;
+    $cookie =~ s/ /%20/gs;
+    $cookie =~ s/\t/%09/gs;
+    $cookie =~ s/\r/%0D/gs;
+    $cookie =~ s/\n/%0A/gs;
+    return $cookie;
+};
+
+##  $cookie = unescape_cookie ($escaped_cookie)
+##    -- Returns $cookie unescaped using cookie escaping rules
+sub unescape_cookie
+{
+    my ($cookie) = shift (@_);
+    $cookie =~ s/%0A/\n/igs;
+    $cookie =~ s/%0D/\r/igs;
+    $cookie =~ s/%09/\t/gs;
+    $cookie =~ s/%20/ /gs;
+    $cookie =~ s/%3A/:/igs;
+    $cookie =~ s/%23/#/igs;
+    $cookie =~ s/%3D/=/igs;
+    $cookie =~ s/%2F/\//igs;
+    $cookie =~ s/%25/%/gs;
+    return $cookie;
+};
+
+##  $hashname = hc_compute_hashname ($httpreq);
+##    -- Computes, stores, and returns the hashname corresponding to $httpreq
+sub hc_compute_hashname
+{
+    my ($httpreq) = shift (@_);
+    my (@path_components);
+    my ($hashname, $orig_hash, $decollision, $i, $find, $readable);
+
+    if (defined ($::HC_httpreq_to_hashname->{$httpreq}))
+    {
+	##  hashnane already defined
+	$hashname = $::HC_httpreq_to_hashname->{$httpreq};
+    }
+    else
+    {
+	##  Must compute new hashname
+
+	##  Try to put something recognizable at the
+	##  end of the hashname
+	$readable = "";
+	if (scalar (@path_components = split ("/", $httpreq)) > 2)
+	{
+	    ##  Looks like a URL, see if I can find the start of the args
+	    $i = -1;
+	    $find = List::Util::first {(++$i > -1) && ($_ eq "?")}
+	      @path_components;
+	    if (defined ($find) && ($i > 0))
+	    {
+		##  Found the URL piece, take the last component
+		$readable =
+		  "_" . substr(uri_escape($path_components[$i-1]),0,32);
+		$readable =~ s/[^a-zA-Z\-0-9\._]/_/g;
+	    };
+	}
+	else
+	{
+	    ##  Probably TTS, take the start of it
+	    $readable = substr($httpreq, 0, 32);
+	    $readable =~ s/[^a-zA-Z\-0-9]/_/g;
+	    $readable = "_" . $readable;
+	};
+	$hashname = Satc::hashify($httpreq, 0, 3) . $readable;
+	$orig_hash = $hashname;
+	$decollision = 0;
+	while (defined ($::HC_hashname_to_httpreq->{$hashname}))
+	{
+	    $hashname = $orig_hash . "_" . ++$decollision;
+	};
+	##  Record it
+	$::HC_httpreq_to_hashname->{$httpreq} = $hashname;
+	$::HC_hashname_to_httpreq->{$hashname} = $httpreq;
+    };
+
+    return $hashname;
+};
+
+##  ($ok, $msg, $hashmap) = parse_urlargs ($url_arg_string)
+##    -- Returns hash map corresponding to URL argument string $url_arg_string
+sub parse_urlargs
+{
+    my $url_arg_string = shift;
+    defined ($url_arg_string) || return (0, "No argument to parse_urlargs()");
+    my $params = new CGI($url_arg_string);
+    my $result = scalar ($params->Vars);
+    my $error = $params->cgi_error;
+    if ($error) {return (0, $error);};
+    return (1, "", $result);
+}
+
+## ($ok, $msg, $cookies) = extract_cookies_from_file ($cookie_file);
+##    -- returns %$cookes hashref mapping cookie names to values
+##       from netscape-format file $cookie_file
+sub extract_cookies_from_file
+{
+    my ($cookie_file) = shift;
+    my ($line, $name, $value, @fields);
+    my (@lines) = ();
+    my ($cookies) = {};
+
+    open (::VGCOOKIEFILE, $cookie_file)
+      || return (0, "Cannot open file: $!");
+    @lines = <::VGCOOKIEFILE>;
+    close (::VGCOOKIEFILE)
+      || return (0, "Cannot close file: $!");
+    foreach $line (@lines)
+    {
+	chomp ($line);
+	@fields = split (/\t/, $line);
+	if (scalar (@fields >= 7))
+	{
+	    $cookies->{$fields[5]} = $fields[6];
+	};
+    };
+
+    return (1, "", $cookies);
+}
+
+##  ($ok, $msg, $httpreq, $hashname, $host) =
+##    hc_request_to_params ($type, $item, $cookie_file, $postdata, $cacheable);
+##    -- Given a http cache request $type and $item and $cookie_file, and
+##       URL-encoded $postdata, returns:
+##         $httpreq = unique scalar string identifier of the request
+##         $hashname = hashname used for single-level access under link/. and
+##         $host = the host for the URL (or "" if it's TTS).
+##       On error $ok is false, and $msg is an error message
+sub hc_request_to_params
+{
+    my ($type) = shift;
+    my ($item) = shift;
+    my ($cookie_file) = shift;
+    my ($postdata) = shift;
+    my ($cacheable) = shift;
+    my ($httpreq, $fixed_name, @path_chars, @path_components);
+    my ($ok, $msg, $component, $leaf_component, $decollision, $orig_path);
+    my ($hashname, $cookie_name, $cookie_value, @cookie_components);
+    my ($cookies, $postdata_map, $postdata_name, @postdata_components);
+    my ($url_noargs, $urlargs, $argindex);
+    my ($host) = "";
+    defined ($::HC_uncacheable_oneup) || ($::HC_uncacheable_oneup = 0);
+
+    if ($type eq "tts")
+    {
+	$httpreq = $item;
+	$cacheable || ($httpreq .= "<" . ++$::HC_uncacheable_oneup . ">");
+
+	##  Compute hashname
+	$hashname = hc_compute_hashname($httpreq);
+    }
+    elsif ($type eq "url")
+    {
+	##  Compute hostname
+	if ($item =~ /^[^:]+:\/\/([^\/]+)\//)
+	{
+	    $host = $1;
+	}
+	else
+	{
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "Cannot extract host from URL: \"" .
+		       $item . "\"");
+	    };
+	};
+
+	##  Compute httpreq
+
+	##  Separate out arguments from URL
+	$argindex = index ($item, "?");
+	if ($argindex > 0)
+	{
+	    $urlargs = substr ($item, $argindex+1);
+	    $url_noargs = substr ($item, 0, $argindex);
+	}
+	else
+	{
+	    $urlargs = "";
+	    $url_noargs = $item;
+	};
+
+	##  Extract the cookie components (implicit parameters) from the file
+	($ok, $msg, $cookies) = extract_cookies_from_file ($cookie_file);
+	@cookie_components = ();
+	if (! $ok)
+	{
+	    logit (LOG_EROR, "Cannot extract cookies from \"" .
+		   $cookie_file . "\" : " . $msg);
+	}
+	else
+	{
+	    foreach $cookie_name (sort (keys (%$cookies)))
+	    {
+		push (@cookie_components,
+		      join (":", escape_cookie($cookie_name),
+			    escape_cookie($cookies->{$cookie_name})));
+	    };
+	};
+
+	##  Extract the postdata components (explicit parameters)
+	if (length ($urlargs) && length ($postdata))
+	{
+	    $urlargs .= "&" . $postdata
+	}
+	elsif (length ($postdata))
+	{
+	    $urlargs = $postdata;
+	};
+	@postdata_components = ();
+	if (length ($urlargs))
+	{
+	    ($ok, $msg, $postdata_map) = parse_urlargs ($urlargs);
+	    if (! $ok)
+	    {
+		logit (LOG_EROR, "Cannot extract urlargs from \"" .
+		       $urlargs . "\" : " . $msg);
+	    }
+	    else
+	    {
+		foreach $postdata_name (sort (keys (%$postdata_map)))
+		{
+		    push (@postdata_components,
+			  join (":", escape_cookie($postdata_name),
+				escape_cookie($postdata_map->
+					      {$postdata_name})));
+		};
+	    };
+	};
+
+	##  Compute httpreq
+	$httpreq = join ("/", $url_noargs, "?",
+			 @cookie_components, ":",
+			 @postdata_components);
+	$cacheable || ($httpreq .= "<" . ++$::HC_uncacheable_oneup . ">");
+
+	##  Compute hashname
+	$hashname = hc_compute_hashname($httpreq);
+    };
+
+    return (1, "", $httpreq, $hashname, $host);
+};
+
+##  initialize_ovxi ($max_channels)
+##    -- Initializes OpenVXI, aborts to fail() on error.
+##       $max_channels is maximum number of concurrent calls.
+sub initialize_ovxi
+{
+    my ($max_channels) = shift (@_);
+    my ($c_fh, $c_fd, $r, $ok, $msg);
+
+    ##  Create a new descriptor pair to communicate with the VXI log output
+    $::VXILog_fh = "::PERL_VXILOG";
+    $c_fh = "::C_VXILOG";
+    no strict "refs";
+    $r = socketpair($::VXILog_fh, $c_fh, AF_UNIX, SOCK_STREAM, PF_UNSPEC);
+    use strict "refs";
+    if (! $r)
+    {
+	($::Loglevel >= LOG_EROR)
+	  && logit (LOG_EROR, "Unable to initialize VXI logging," .
+		    " failure from socketpair(): $!");
+	return;
+    };
+
+    ##  Close down the original c-side descriptor behind perl's back
+    ##  so it doesn't interfere with multi-threaded use
+    $c_fd = POSIX::dup (fileno ($c_fh));
+    no strict "refs";
+    close ($c_fh);
+    use strict "refs";
+
+    $::Clients->{$::VXILog_fh} = {"type" => FHINFO_TYPE_VXILOG,
+				  "fh" => $::VXILog_fh,
+				  "host" => "localhost"};
+    ((($ok, $msg) = $::Scom->register ("$::VXILog_fh+"))[0])
+      || fail ("Failure from Scom->register on $::VXILog_fh: $msg");
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "Passing fd " . $c_fd .
+	      " to VXI for logging, listening on " . fileno ($::VXILog_fh));
+    };
+
+    ##  Initialize the VXI platform
+    (($ok, $msg, $::Platform_handle) =
+     Vxglue::_start_voiceglue_platform ($max_channels,
+					$c_fd, $::Loglevel))[0]
+      || fail ("Failure from start_voiceglue_platform: $msg");
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "VXI platform initialized")
+    };
+
+    ##  Set VXI diagnostic trace state
+    if ($::Loglevel >= 7)
+    {
+	Vxglue::_set_voiceglue_trace (1);
+    };
+};
+
+##  shutdown_ovxi
+##    -- Shuts down OpenVXI.
+sub shutdown_ovxi
+{
+    my ($ok, $msg);
+
+    ##  Shutdown the VXI platform
+    (($ok, $msg) =
+     Vxglue::_stop_voiceglue_platform ($::Platform_handle))[0]
+	 || logit (LOG_EROR, "Failure from stop_voiceglue_platform: $msg");
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "VXI platform shutdown");
+    };
+};
+
+##  $contentdir = get_url_contentdir ($info);
+##    -- For $info either a reqrec or cacheinfo of type "url",
+##       returns the absolute
+##       path of the contentdir: "$::VgCacheDir/url/<hashname>"
+sub get_url_contentdir
+{
+    my $cacheinfo = shift;
+    return join ("/", $::VgCacheDir, "url", $cacheinfo->{"hashname"});
+}
+
+##  $path = get_abs_path ($cacheinfo);
+##    -- Returns the absolute path of the content for the cached item.
+##	 For type "url" is "$::VgCacheDir/url/<hashname>/req<exten>"
+##	 For type "tts" is "$::VgCacheDir/tts/<hashname><exten>"
+sub get_abs_path
+{
+    my $cacheinfo = shift;
+    my ($path, $exten);
+    if (! defined ($cacheinfo))
+    {
+	logit (LOG_EROR, "Undefined cacheinfo passed to get_abs_path()\n");
+	return undef;
+    };
+    if ($cacheinfo->{"type"} eq "url")
+    {
+	$path = join ("/", get_url_contentdir ($cacheinfo), "req");
+    }
+    elsif ($cacheinfo->{"type"} eq "tts")
+    {
+	$path = join ("/", $::VgCacheDir, "tts", $cacheinfo->{"hashname"});
+    }
+    else
+    {
+	logit (LOG_EROR, "Unrecognized cacheinfo type \"" .
+	       $cacheinfo->{"type"} .
+	       "\" passed to get_abs_path()\n");
+	return undef;
+    };
+    if (defined ($exten = $cacheinfo->{"exten"}))
+    {
+	$path .= $exten;
+    };
+    return $path;
+}
+
+##  $path = get_ast_path ($cacheinfo);
+##    -- Returns the asterisk path of the content for the cached audio item.
+##	 For type "url" is "$::VgCacheDir/url/<hashname>/req"
+##	 For type "tts" is "$::VgCacheDir/tts/<hashname>"
+sub get_ast_path
+{
+    my $cacheinfo = shift;
+    my ($path, $exten);
+    if (! defined ($cacheinfo))
+    {
+	logit (LOG_EROR, "Undefined cacheinfo passed to get_ast_path()\n");
+	return undef;
+    };
+    if ($cacheinfo->{"type"} eq "url")
+    {
+	$path = join ("/", $::AstSoundPrefix, "url",
+		      $cacheinfo->{"hashname"}, "req");
+    }
+    elsif ($cacheinfo->{"type"} eq "tts")
+    {
+	$path = join ("/", $::AstSoundPrefix, "tts",
+		      $cacheinfo->{"hashname"});
+    }
+    else
+    {
+	logit (LOG_EROR, "Unrecognized cacheinfo type \"" .
+	       $cacheinfo->{"type"} .
+	       "\" passed to get_path()\n");
+	return undef;
+    };
+    return $path;
+}
+
+##  ($cacheable, $reason) = is_cacheable ($header_values);
+##    Returns $cacheable of true if the $header_values (hashref of arrayrefs)
+##    specifies cacheable content.  $reason is a human-readable reason.
+sub is_cacheable
+{
+    my ($header_values) = shift (@_);
+    my ($value);
+
+    (defined ($header_values->{"LAST-MODIFIED"}))
+      || return (0, "no Last-Modified found in HTTP header");
+    if (defined ($header_values->{"CACHE-CONTROL"}))
+    {
+	foreach $value (@{$header_values->{"CACHE-CONTROL"}})
+	{
+	    if ($header_values->{"CACHE-CONTROL"} =~ /no-cache/i)
+	    {return (0, "found Cache-Control: no-cache in HTTP header");};
+	    if ($header_values->{"CACHE-CONTROL"} =~ /max-age=0/i)
+	    {return (0, "found Cache-Control: max-age=0 in HTTP header");};
+	    if ($header_values->{"CACHE-CONTROL"} =~ /s-maxage=0/i)
+	    {return (0, "found Cache-Control: s-maxage=0 in HTTP header");};
+	};
+    };
+    ##  ZZZZZ  Should also have an Expires vs. Date check here
+
+    return (1, "Last-Modified found in HTTP headers");
+}
+
+##  waitfor_httpcache_children();
+##    -- Waits for httpcache children to exit
+##       (Called before exiting)
+sub waitfor_httpcache_children
+{
+    while (wait() != -1) {};
+};
+
+##  process_cache_child_result ($cacheinfo);
+##    -- Called when a new result is available from httpcache running
+##       a job to retrieve it
+sub process_cache_child_result
+{
+    my ($cacheinfo) = shift;
+    my ($request_id, @request_ids);
+
+    ##  See if parsing necessary due to parsevxml flag
+    if (($cacheinfo->{"status"} == 0) && ($cacheinfo->{"parsevxml"}) &&
+	(! defined ($cacheinfo->{"parseaddr"})))
+    {
+	##  Have to send parse request and await result
+	my ($request_id) = (keys (%{$cacheinfo->{"ids"}}))[0];
+	delete $cacheinfo->{"ids"}{$request_id};
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "hcreq=[$request_id] " .
+		   "requesting parsevxml");
+	};
+	send_bytes ($::HC_Client_Fhinfo,
+		    "done $request_id 0 " .
+		    get_abs_path($cacheinfo) . " " .
+		    get_ast_path($cacheinfo) . " " .
+		    uri_escape($cacheinfo->{"content-type"}) .
+		    " -\n");
+	return;
+    };
+
+    ##  Process all outstanding requests waiting on this path
+    @request_ids = keys (%{$cacheinfo->{"ids"}});
+    $cacheinfo->{"ids"} = {};
+    foreach $request_id (@request_ids)
+    {
+	if ($cacheinfo->{"status"} == 1)
+	{
+	    ##  Return success
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "hcreq=[$request_id] succeeded, " .
+		      "returning success (=1)");
+	    };
+	    send_bytes ($::HC_Client_Fhinfo,
+			"done $request_id 1 " .
+			get_abs_path($cacheinfo) . " " .
+			get_ast_path($cacheinfo) . " " .
+			uri_escape($cacheinfo->{"content-type"}) .
+			" -\n");
+	    delete $::Request_spec->{$request_id};
+	}
+	else
+	{
+	    ##  Failure, look for fallback
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id] failed, " .
+		       "looking for fallback");
+	    };
+	    shift (@{$::Request_spec->{$request_id}});
+	    if (scalar (@{$::Request_spec->{$request_id}}) == 0)
+	    {
+		##  Out of fallbacks
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG,
+			   "hcreq=[$request_id] no more fallbacks, " .
+			   "returning failure (=-1)");
+		};
+		delete $::Request_spec->{$request_id};
+		send_bytes ($::HC_Client_Fhinfo,
+			    "done $request_id -1 - - - -\n");
+	    }
+	    else
+	    {
+		##  Try fallback
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG,
+			   "hcreq=[$request_id] trying fallback ");
+		};
+		process_next_request_item ($request_id);
+	    };
+	};
+    };
+};
+
+##  remove_contentdir ($cacheinfo)
+##    -- Given a record in $::Hashname_to_cacheinfo, removes
+##       its contentdir (if any) and all of its contents
+sub remove_contentdir
+{
+    my $cacheinfo = shift;
+    if ($cacheinfo->{"type"} ne "url") {return;};
+    my $contentdir = get_url_contentdir ($cacheinfo);
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "Removing contentdir " . $contentdir);
+    };
+    system ("rm", "-r", "-f", $contentdir);
+}
+
+##  http_cache_child_finished ($pid, $job_status);
+##    --  handles finished http cache child process
+sub http_cache_child_finished
+{
+    my $pid = shift;
+    my $job_status = shift;
+    my ($cacheinfo, $hashname, @statinfo);
+    my ($content_path, $content_path_tmp, $header_path, $error_path);
+    my ($reason, $vxmladdr, $cacheable_claim, $content_length);
+    my ($ok, $msg, $i, $error_msg, $name, $value, $type, $content_type);
+    my ($item, $contentdir, $exten, $ast_path, $link_path, $link_target);
+    my ($contents);
+    my ($new_content) = 1;
+    my ($header_values) = {};
+    my (@headers) = ();
+
+    $hashname = $::Pid_to_hashname->{$pid};
+    delete $::Pid_to_hashname->{$pid};
+    if (! defined ($hashname))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "Unknown pid=$pid harvested");
+	};
+	return;
+    };
+
+    $cacheinfo = $::Hashname_to_cacheinfo->{$hashname};
+    if (! defined ($cacheinfo))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR,
+		   "Unknown hashname \"$hashname\" from harvested pid=$pid");
+	};
+	return;
+    };
+    $item = $cacheinfo->{"item"};
+
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "pid=$pid done on $item");
+    };
+
+    $type = $cacheinfo->{"type"};
+    $cacheinfo->{"status"} = -1;  ##  Assume failure until success proven
+
+    if ($type eq "url")
+    {
+	##  Handle url fetch results (from curl)
+	$contentdir = get_url_contentdir ($cacheinfo);
+	$header_path = $contentdir . "/req.header";
+	$content_path = $contentdir . "/req";
+	$content_path_tmp = $contentdir . "/req.tmp";
+	$error_path = $contentdir . "/req.err";
+
+	##  Check for error result from curl
+	if ($job_status != 0)
+	{
+	    ##  Get error file, if any
+	    ($ok, $msg, $error_msg) = getfile ($error_path);
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "failed to retrieve URL " .
+		       $item .
+		       (defined ($error_msg) ? " curl error: \"" .
+			$error_msg . "\"" : "") .
+		       (defined ($cacheinfo->{"cmd"}) ? " on curl command: ".
+			$cacheinfo->{"cmd"} : "")
+		      );
+	    };
+
+	    ##  Call handler and exit
+	    process_cache_child_result ($cacheinfo);
+	    remove_contentdir ($cacheinfo);
+	    return;
+	};
+
+	##  Extract headers
+	if (! (($ok, $msg, @headers) = getfile_lines ($header_path))[0])
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "failed to retrieve URL $item : " .
+		       "no HTTP headers returned in $header_path" .
+		       (defined ($cacheinfo->{"cmd"}) ? " on curl command: ".
+			$cacheinfo->{"cmd"} : ""));
+	    };
+
+	    ##  Call handler and exit
+	    process_cache_child_result ($cacheinfo);
+	    remove_contentdir ($cacheinfo);
+	    return;
+	};
+
+	foreach $value (@headers)
+	{
+	    $value =~ s/[\r\n]//g;
+	};
+	logit (LOG_DBUG,"retrieval of URL $item returned " .
+	       "the following HTTP headers: " .
+	       join ("; ", @headers));
+
+	##  Calculate headers
+	for ($i = 1; $i < scalar (@headers); ++$i)
+	{
+	    if ($headers[$i] =~ /^\s*([^:]+)\s*:\s*(.*)\s*$/)
+	    {
+		$name = $1;
+		$value = $2;
+		$name = uc $name;
+		if (! defined ($header_values->{$name}))
+		{
+		    $header_values->{$name} = [$value];
+		}
+		else
+		{
+		    push (@{$header_values->{$name}}, $value);
+		};
+	    };
+	};
+
+	##  Check for cacheable result
+	($cacheable_claim, $reason) = is_cacheable ($header_values);
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "$item claims to be " .
+		   ($cacheable_claim ? "" : "not ") .
+		   "cacheable because " . $reason);
+	};
+	if (! $cacheable_claim)
+	{
+	    $cacheinfo->{"cacheable"} = 0;
+	};
+
+	##  Check for 304 (Not Modified)
+	##  First header line will look like:    HTTP/1.1 304 Not Modified
+	##  and the content file will not be created.
+	if ($headers[0] =~ /\s+304\s+/)
+	{
+	    ##  Existing cache version has been validated
+	    $new_content = 0;
+	}
+	else
+	{
+	    ##  Determine content type
+	    $content_type = $header_values->{"CONTENT-TYPE"}[0];
+	    if (defined ($content_type))
+	    {
+		$content_type = lc($content_type);
+	    };
+	    if ($cacheinfo->{"audio"})
+	    {
+		##  Set exten to valid asterisk audio file extension based
+		##  on Content-Type (hopefully)
+		if ((! defined ($content_type)) ||
+		    (! length ($content_type)) ||
+		    ($content_type =~ /^text\/plain/i))
+		{
+		    my ($assumed_type);
+
+		    if ($::Loglevel >= LOG_DBUG)
+		    {
+			logit (LOG_DBUG,
+			       "Trying to use file extension to determine " .
+			       "content-type for $item");
+		    };
+
+		    ##  Try to determine by URL extension
+		    if ($item =~ /\.([a-zA-Z]+)(\?.+)?$/)
+		    {
+			$exten = lc $1;
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG,
+				   "Found extension \"" . $exten .
+				   "\", trying to use it");
+			};
+			$assumed_type =
+			  $::File_extention_to_content_type->{$exten};
+		    };
+		    if (defined ($assumed_type))
+		    {
+			($::Loglevel >= LOG_WARN)
+			  && logit (LOG_WARN, "assuming Content-Type " .
+				    $assumed_type .
+				    " for retrieved URL $item " .
+				    "please fix returned Content-Type");
+			$content_type = $assumed_type;
+		    }
+		    else
+		    {
+			if (defined ($content_type))
+			{
+			    ($::Loglevel >= LOG_EROR)
+			      && logit (LOG_EROR,
+					"Unsupported Content-Type of \"" .
+					$content_type .
+					"\" returned for $item" .
+					(defined ($exten) ?
+					 " (extension of \"" . $exten .
+					 "\" did not help)"
+					 : ""));
+			}
+			else
+			{
+			    ($::Loglevel >= LOG_EROR)
+			      && logit (LOG_EROR, "No Content-Type returned " .
+					"for $item" .
+					(defined ($exten) ?
+					 " (extension of \"" . $exten .
+					 "\" did not help)"
+					 : ""));
+			};
+			##  Call handler and exit
+			process_cache_child_result ($cacheinfo);
+			remove_contentdir ($cacheinfo);
+			return;
+		    };
+		}
+		elsif (! defined
+		       ($exten =
+			$::Content_type_to_file_extension->{$content_type}))
+		{
+		    ($::Loglevel >= LOG_EROR)
+		      && logit (LOG_EROR, "Unsupported Content-Type of \"" .
+				$content_type .
+				"\" returned for $item");
+		    ##  Call handler and exit
+		    process_cache_child_result ($cacheinfo);
+		    remove_contentdir ($cacheinfo);
+		    return;
+		};
+		$exten = "." . $exten;
+	    };
+	    defined ($content_type) || ($content_type = "unknown");
+	    $cacheinfo->{"content-type"} = $content_type;
+	    $cacheinfo->{"exten"} = $exten;
+
+	    ##  Move contents onto new version
+	    if (defined ($exten))
+	    {
+		$content_path .= $exten;
+	    };
+	    @statinfo = stat ($content_path_tmp);
+	    if ((scalar (@statinfo) < 8) || ($statinfo[7] == 0))
+	    {
+		##  Content file non-existent, but curl does this
+		##  if it receives 0 bytes.  Check for that.
+		if (defined ($content_length =
+			     $header_values->{"CONTENT-LENGTH"}[0]) &&
+		    ($content_length =~ /^\s*0\s*$/))
+		{
+		    ##  Create the file
+		    if (! (open (::FH, ">$content_path_tmp") && close (::FH)))
+		    {
+			if ($::Loglevel >= LOG_EROR)
+			{
+			    logit (LOG_EROR,
+				   "$content_path_tmp cannot be touched: $!");
+			};
+
+			##  Call handler and exit
+			process_cache_child_result ($cacheinfo);
+			remove_contentdir ($cacheinfo);
+			return;
+		    };
+		    @statinfo = stat ($content_path_tmp);
+		}
+		else
+		{
+		    ##  Failed to get content
+		    if ($::Loglevel >= LOG_EROR)
+		    {
+			logit (LOG_EROR,
+			       "$content_path_tmp file has bad stat: $!");
+		    };
+
+		    ##  Call handler and exit
+		    process_cache_child_result ($cacheinfo);
+		    remove_contentdir ($cacheinfo);
+		    return;
+		};
+	    };
+
+	    if (! rename ($content_path_tmp, $content_path))
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR,
+			   "Cannot rename $content_path_tmp -> " .
+			   "$content_path: $!");
+		};
+
+		##  Call handler and exit
+		process_cache_child_result ($cacheinfo);
+		remove_contentdir ($cacheinfo);
+		return;
+	    };
+
+	    if (! $cacheinfo->{"revalidating"})
+	    {
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "Cache add path $content_path" .
+			   " (URL content creation succeeded)");
+		};
+	    };
+
+	    ##  Log the (maybe partial) contents of non-audio, non-code results
+	    if ((! $cacheinfo->{"audio"}) &&
+		(! $cacheinfo->{"parsevxml"}) &&
+		(($content_type =~ /^text/) ||
+		 ($content_type =~ /^application\/xml/)))
+	    {
+		my ($bytes) = $statinfo[7];
+		my ($content_log) = "";
+		if ($bytes > 0)
+		{
+		    ($ok, $msg, $contents) = getfile ($content_path);
+		    $content_log =  " containing: " .
+		      substr ($contents, 0, 1024) .
+			(($bytes > 1024) ? "..." : "");
+		};
+		if ($::Loglevel >= LOG_INFO)
+		{
+		    logit (LOG_INFO, "curl command: <" .
+			   $cacheinfo->{"cmd"} .
+			   "> fetched " . $bytes . " bytes" .
+			   $content_log);
+		};
+	    };
+	};
+
+	##  Manage the parse tree cache
+	$cacheinfo->{"status"} = 1;
+	if ($new_content)
+	{
+	    if (defined ($vxmladdr = $cacheinfo->{"parseaddr"}))
+	    {
+		##  Release the old parse tree
+		if ($::Loglevel >= LOG_DBUG)
+		{
+		    logit (LOG_DBUG, "Cache del tree " . $vxmladdr);
+		};
+		send_bytes ($::HC_Client_Fhinfo,
+			    "free " . $vxmladdr . "\n");
+		delete $cacheinfo->{"parseaddr"};
+	    };
+
+	    if ($cacheinfo->{"parsevxml"})
+	    {
+		##  Must create a new parse tree
+		$cacheinfo->{"status"} = 0;
+	    };
+	};
+
+	##  Record success
+	$cacheinfo->{"time"} = $::Now;
+	unlink ($header_path, $error_path);
+    }
+    else
+    {
+	##  Handle TTS case
+
+	##  Check for success based on content existence
+	$exten = ".wav";
+	$content_type = "tts";
+	$cacheinfo->{"exten"} = $exten;
+	$cacheinfo->{"content-type"} = $content_type;
+	$content_path = join ("/", $::VgCacheDir, "tts",
+			      $cacheinfo->{"hashname"} . $exten);
+	@statinfo = stat ($content_path);
+	if ((scalar (@statinfo) < 8) || ($statinfo[7] == 0))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "TTS genration of $content_path failed, " .
+		       "file has bad stat: $!");
+	    };
+
+	    ##  Call error handler and exit
+	    process_cache_child_result ($cacheinfo);
+	    return;
+	};
+
+	##  Record success getting content
+	$cacheinfo->{"status"} = 1;
+	$cacheinfo->{"time"} = $::Now;
+	if (! $cacheinfo->{"revalidating"})
+	{
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "Cache add path $content_path" .
+		       " (TTS content creation succeeded)");
+	    };
+	};
+    };
+
+    process_cache_child_result ($cacheinfo);
+};
+
+##  check_http_cache_children()
+##    --  Looks for any finished http cache child processes
+sub check_http_cache_children
+{
+    my ($pid, $job_status);
+
+    while (($pid = waitpid (-1, WNOHANG)) > 0)
+    {
+	$job_status = $?;
+	http_cache_child_finished ($pid, $job_status);
+    };
+};
+
+##  remove_cache_entry ($cacheinfo, $keep_content)
+##    -- Removes cache entry at $cacheinfo including any parse tree.
+##       If $keep_content is true, leaves the path and link in place.
+sub remove_cache_entry
+{
+    my $cacheinfo = shift;
+    my $keep_content = shift;
+    my ($vxmladdr, $hashname, $httpreq, $rmpath, $content_path);
+    defined ($keep_content) || ($keep_content = 0);
+
+    if (! defined ($cacheinfo))
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR,
+		   "remove_cache_entry() passed undef cacheinfo");
+	};
+	return;
+    };
+
+    if (! $keep_content)
+    {
+	$content_path = get_abs_path ($cacheinfo);
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "Cache del path " . $content_path);
+	};
+	if ($cacheinfo->{"type"} eq "tts")
+	{
+	    ##  Remove only the tts/<name> file
+	    unlink ($content_path);
+	}
+	else
+	{
+	    ##  Remove contentdir
+	    remove_contentdir ($cacheinfo);
+	};
+    };
+
+    if (defined ($vxmladdr = $cacheinfo->{"parseaddr"}))
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG, "Cache del tree " .
+		   $vxmladdr . " (VXMLDocument)");
+	};
+	send_bytes ($::HC_Client_Fhinfo,
+		    "free " . $vxmladdr . "\n");
+    }
+
+    $hashname = $cacheinfo->{"hashname"};
+    if (defined ($httpreq = $::HC_hashname_to_httpreq->{$hashname}))
+    {
+	delete $::HC_hashname_to_httpreq->{$hashname};
+	delete $::HC_httpreq_to_hashname->{$httpreq};
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR,
+		   "remove_cache_entry() failed to find " .
+		   "HC_hashname_to_httpreq entry for hashname \"" .
+		   $hashname . "\"");
+	};
+    };
+
+    delete $::Hashname_to_cacheinfo->{$hashname};
+}
+
+##  process_next_request_item ($request_id)
+##    -- Attempts to satisfy the top request in $::Request_spec->{$request_id}
+sub process_next_request_item
+{
+    my ($request_id) = shift (@_);
+    my ($req_spec, $pid, $cacheinfo, $status, $request_type, @cmd);
+    my ($cacheable, $ok, $msg, $cookies, $cmd, $hashname);
+    my (@curl_base_flags, @curl_getoutput_flags, @postdata_flags);
+    my (@curl_silence_flags);
+
+    $req_spec = $::Request_spec->{$request_id}[0];
+    $hashname = $req_spec->{"hashname"};
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG,
+	       "hcreq=[$request_id] processing " . $req_spec->{"type"} .
+	       " request httpreq=" . $req_spec->{"httpreq"} .
+	       " method=" . $req_spec->{"method"} .
+	       " postdata=" . ((defined $req_spec->{"postdata"}) ?
+			       $req_spec->{"postdata"} : "") .
+	       " audio=" . $req_spec->{"audio"} .
+	       " parsevxml=" . $req_spec->{"parsevxml"} .
+	       " hashname=" . $hashname .
+	       " host=" . $req_spec->{"host"} .
+	       " maxage=" . $req_spec->{"maxage"} .
+	       " lang=" . (defined ($req_spec->{"lang"}) ?
+			   $req_spec->{"lang"} : "") .
+	       " cookie_file=" . $req_spec->{"cookie_file"} .
+	       " timeout=" . $req_spec->{"timeout"} .
+	       " for " . $req_spec->{"item"});
+    };
+
+    ##  See if the $::Hashname_to_cacheinfo knows about this item
+    $status = undef;
+    if (defined ($cacheinfo = $::Hashname_to_cacheinfo->{$hashname}))
+    {
+	$status = $cacheinfo->{"status"};
+	$cacheable = $cacheinfo->{"cacheable"};
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG,
+		   "hcreq=[$request_id] found existing entry with status=" .
+		   $status . " and cacheable=" . $cacheable);
+	};
+
+	##  Check for retry on past failure
+	if (($status == -1) &&
+	    ($cacheinfo->{"time"} + $::Retry_seconds_for_audio_fetch_failures
+	     < $::Now))
+	{
+	    ##  Ignore previous failure so it can be retried
+	    delete $::Hashname_to_cacheinfo->{$hashname};
+	    $status = undef;
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id] retrying past failed attempt");
+	    };
+	};
+    };
+
+    ##  See if a previous request finished with success and
+    ##  its cached value can be used implicitly
+    if (defined ($status) && ($status == 1))
+    {
+	if ($req_spec->{"maxage"} <= $::Now - $cacheinfo->{"time"})
+	{
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id] must revalidate cached value, " .
+		       "cached contents are too old (maxage=" .
+		       $req_spec->{"maxage"} . ", age=" .
+		       ($::Now - $cacheinfo->{"time"}) . ")");
+	    };
+	}
+	elsif (! $cacheinfo->{"cacheable"})
+	{
+	    ##  Remove old cached value
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id]" .
+		       " removing old cached value because" .
+		       " contents are uncacheable");
+	    };
+
+	    $status = undef;
+	    remove_cache_entry ($cacheinfo);
+	}
+	else
+	{
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id] using cached value " .
+		       get_abs_path($cacheinfo));
+	    };
+	    delete $::Request_spec->{$request_id};
+	    $cacheinfo->{"last_used"} = $::Now;
+	    send_bytes ($::HC_Client_Fhinfo,
+			"done $request_id $status " .
+			get_abs_path ($cacheinfo) . " " .
+			get_ast_path ($cacheinfo) . " " .
+			uri_escape($cacheinfo->{"content-type"}) . " " .
+			(defined ($cacheinfo->{"parseaddr"}) ?
+			 $cacheinfo->{"parseaddr"} : "-") .
+			"\n");
+	    return;
+	};
+    };
+
+    ##  See if we can tag onto an existing job
+    if (defined ($status) && ($status == 0))
+    {
+	##  Item is in process, so tag along
+	$cacheinfo->{"ids"}{$request_id} = 1;
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG,
+		   "hcreq=[$request_id] awaiting existing job pid=" .
+		   $cacheinfo->{"pid"} . " for " . $req_spec->{"item"});
+	};
+	return;
+    };
+
+    ##  See if we have failed, and need to move to the next fallback
+    if (defined ($status) && ($status == -1))
+    {
+	if ($::Loglevel >= LOG_DBUG)
+	{
+	    logit (LOG_DBUG,
+		   "hcreq=[$request_id] result=$status (failed) in cache for " .
+		   $req_spec->{"item"});
+	};
+	shift (@{$::Request_spec->{$request_id}});
+	if (scalar (@{$::Request_spec->{$request_id}}) == 0)
+	{
+	    ##  Out of fallbacks
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG,
+		       "hcreq=[$request_id] no more fallbacks, " .
+		       "returning failure (=-1)");
+	    };
+	    delete $::Request_spec->{$request_id};
+	    send_bytes ($::HC_Client_Fhinfo,
+			"done $request_id $status - - - -\n");
+	    return;
+	};
+
+	##  Try the next fallback
+	process_next_request_item ($request_id);
+	return;
+    };
+
+    ##  Have to generate a job.
+    ##  If $status is defined, then this a revalidation of a cached item.
+    ##  Put the command to run in @cmd
+    $request_type = $req_spec->{"type"};
+    if ($request_type eq "tts")
+    {
+	##  flite doesn't do exit status codes
+	@cmd = ("voiceglue_tts_gen", "-t", $req_spec->{"item"},
+		join ("/", $::VgCacheDir, "tts", $hashname . ".wav"),
+		$req_spec->{"lang"});
+    }
+    elsif ($request_type eq "url")
+    {
+	my ($name, $dir, $url);
+	my (@validation_headers) = ();
+
+	##  Make sure the directory exists
+	$dir = get_url_contentdir ($req_spec);
+	eval { mkpath($dir) };
+	if ($@)
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR,
+		       "hcreq=[$request_id] Cannot mkpath \"" . $dir .
+		       "\" : $@");
+	    };
+	    delete $::Request_spec->{$request_id};
+	    send_bytes ($::HC_Client_Fhinfo, "done $request_id -1 - - - -\n");
+	    return;
+	}
+
+	##  Determine headers for validation
+	if (defined ($status))
+	{
+	    my ($gmtstring);
+	    $gmtstring = gmtime($cacheinfo->{"time"}) . " GMT";
+	    @validation_headers = ("-z", $gmtstring);
+	};
+
+	##  Determine postdata
+	@postdata_flags = ();
+	$url = $req_spec->{"item"};
+	if ($req_spec->{"method"} =~ /^post/i)
+	{
+	    if (defined ($req_spec->{"postdata"}) &&
+		length ($req_spec->{"postdata"}))
+	    {
+		@postdata_flags = ("-d", $req_spec->{"postdata"})
+	    }
+	    else
+	    {
+		@postdata_flags = ("-d", "");
+	    };
+	}
+	elsif (length ($req_spec->{"postdata"}))
+	{
+	    ##  Must be a get with params passed as postdata
+	    if ($url =~ /\?/)
+	    {
+		##  Add to end of arg list
+		$url .= "&" . $req_spec->{"postdata"};
+	    }
+	    else
+	    {
+		##  Make new arg list
+		$url .= "?" . $req_spec->{"postdata"};
+	    };
+	};
+	@curl_base_flags = ("curl", "-k", "-m", $req_spec->{"timeout"});
+	@curl_silence_flags = ("-q", "-f", "-s", "-S");
+	@curl_getoutput_flags =
+	  ("--create-dirs",
+	   "-o", join ("/", $dir, "req.tmp"),
+	   "-b", $req_spec->{"cookie_file"},
+	   "-c", $req_spec->{"cookie_file"},
+	   "-D", join ("/", $dir, "req.header"),
+	   "--stderr", join ("/", $dir, "req.err")
+	  );
+	@cmd = (@curl_base_flags,
+		@curl_silence_flags,
+		@validation_headers,
+		@curl_getoutput_flags,
+		@postdata_flags,
+		"-b", $req_spec->{"cookie_file"},
+		$url);
+	($ok, $msg, $cookies) =
+	  extract_cookies_from_file ($req_spec->{"cookie_file"});
+	$cmd =
+	  join (" ",
+		@curl_base_flags,
+		@validation_headers,
+		@postdata_flags,
+		(($ok && defined ($cookies) && scalar(keys(%$cookies))) ?
+		 ("-b", join (",", map
+			      {join (":", $_, $cookies->{$_})}
+			      (keys(%$cookies))))
+		 : ()),
+		$url);
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR,
+		   "hcreq=[$request_id] has illegal type \"" .
+		   $request_type . "\" for item \"" .
+		   $req_spec->{"item"});
+	};
+	delete $::Request_spec->{$request_id};
+	send_bytes ($::HC_Client_Fhinfo, "done $request_id -1 - - - -\n");
+	return;
+    };
+
+    ##  Run the command in the background
+    $pid = fork();
+    if (! defined ($pid))
+    {
+	##  Failure to fork
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "hcreq=[$request_id] Failure from fork: $!");
+	};
+	send_bytes ($::HC_Client_Fhinfo, "done $request_id -1 - - - -\n");
+	return;
+    };
+    if ($pid == 0)
+    {
+	##  I am the child
+	exec (@cmd);
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    print ::STDERR ("voiceglue httpcache: failure from exec of \"" .
+			    join (" ", @cmd) . "\": $!\n");
+	};
+	exit (-1);
+    };
+
+    ##  I am the parent
+    if ($::Loglevel >= LOG_DBUG)
+    {
+	logit (LOG_DBUG, "hcreq=[$request_id] started pid=$pid as " .
+	       join (" ", @cmd));
+    };
+
+    $::Pid_to_hashname->{$pid} = $hashname;
+
+    if (! defined ($status))
+    {
+	##  If not a revalidation, make a new $::Hashname_to_cacheinfo entry
+	$cacheinfo = {"type" => $request_type,
+		      "audio" => $req_spec->{"audio"},
+		      "parsevxml" => $req_spec->{"parsevxml"},
+		      "item" => $req_spec->{"item"},
+		      "revalidating" => 0,
+		      "hashname" => $hashname};
+	$::Hashname_to_cacheinfo->{$hashname} = $cacheinfo;
+    };
+    if (defined ($status))
+    {
+	$cacheinfo->{"revalidating"} = 1;
+    };
+    $cacheinfo->{"status"} = 0;
+    $cacheinfo->{"time"} = $::Now;
+    $cacheinfo->{"last_used"} = $::Now;
+    $cacheinfo->{"ids"} = {$request_id => 1};
+    $cacheinfo->{"cacheable"} = 1;
+    if (defined ($cmd)) {$cacheinfo->{"cmd"} = $cmd;};
+};
+
+##  handle_msg_from_voiceglue_main ($bytes)
+##    -- Handles http cache request in $bytes from voiceglue main
+sub handle_msg_from_voiceglue_main
+{
+    my ($bytes) = shift (@_);
+    my ($ok, $msg, $request_options, $timeout, $option, @options);
+    my ($request_id, $request_type, $request_item);
+    my ($has_fallback, $fallback_type, $fallback_item, $fallback_path);
+    my ($maxage, $hashname, $fallback_hashname, $cookie_file);
+    my ($spec, $usage, $method, $postdata);
+    my ($httpreq, $fallback_httpreq, $host, $fallback_host);
+    my ($cacheable, $value, $lang, $addr, $req_spec, $cacheinfo);
+
+    ##  First parse out id, options, and cookie_file so we can
+    ##  determine whether fallback parameters will be included.
+    if ($bytes =~ /^req\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+/s)
+    {
+	$request_id = $1;
+	$request_options = $2;
+	$cookie_file = $3;
+	$method = $4;
+	$postdata = $5;
+	if ($postdata eq "-")
+	{
+	    $postdata = "";
+	};
+    }
+    elsif ($bytes =~ /^parsed\s+(\d+)\s+(\S+)\s*/s)
+    {
+	$request_id = $1;
+	$addr = $2;
+	if (! defined ($req_spec = $::Request_spec->{$request_id}))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "\"parsed\" request: "
+		       . dump_bytes ($bytes) . " has no Request_spec record");
+	    };
+	    return;
+	};
+	if (! defined ($req_spec = $req_spec->[0]))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "\"parsed\" request: "
+		       . dump_bytes ($bytes) .
+		       " has zero items in Request_spec record");
+	    };
+	    return;
+	};
+	if (! defined ($hashname = $req_spec->{"hashname"}))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "\"parsed\" request: "
+		       . dump_bytes ($bytes) .
+		       " has no Request_spec hashname entry");
+	    };
+	    return;
+	};
+	if (! defined ($cacheinfo = $::Hashname_to_cacheinfo->{$hashname}))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "\"parsed\" request: "
+		       . dump_bytes ($bytes) .
+		       " has no Hashname_to_cacheinfo for hashname " .
+		       $hashname);
+	    };
+	    return;
+	};
+	if ($addr eq "-")
+	{
+	    $cacheinfo->{"status"} = -1;
+	}
+	else
+	{
+	    if ($::Loglevel >= LOG_DBUG)
+	    {
+		logit (LOG_DBUG, "Cache add tree $addr");
+	    };
+	    $cacheinfo->{"parseaddr"} = $addr;
+	    $cacheinfo->{"status"} = 1;
+	};
+	process_cache_child_result ($cacheinfo);
+	return;
+    }
+    else
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "invalid request: "
+		   . dump_bytes ($bytes) . ": bad basic parse");
+	};
+	return;
+    };
+
+    ##  Get all options
+    $timeout = $::Default_httpcache_fetch_timeout;
+    $maxage = $::Default_httpcache_maxage;
+    $has_fallback = 0;
+    @options = split (/:/, $request_options);
+    foreach $option (@options)
+    {
+	if ($option eq "f")
+	{
+	    $has_fallback = 1;
+	}
+	elsif ($option eq "a")
+	{
+	    $usage = "a";
+	}
+	elsif ($option eq "v")
+	{
+	    $usage = "v";
+	}
+	elsif ($option eq "x")
+	{
+	    $usage = "x";
+	}
+	elsif (($option =~ /^t=(.+)$/) &&
+	       defined ($value = parse_vxml_timeval($1, "s")))
+	{
+	    $timeout = $value / 1000;
+	}
+	elsif (($option =~ /^age=(.+)$/) &&
+	       defined ($value = parse_vxml_timeval($1, "s")))
+	{
+	    $maxage = $value / 1000;
+	}
+	elsif ($option =~ /^lang=(.+)$/)
+	{
+	    $lang = $1;
+	}
+	elsif ($option ne "-")
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "Unrecognized option \"" .
+		       $option . "\" in request " .
+		       dump_bytes ($bytes));
+	    };
+	};
+    };
+    if (! defined ($usage))
+    {
+	($::Loglevel >= LOG_WARN)
+	  && logit (LOG_WARN, "No option \"a\" \"v\" or \"x\", assuming \"v\"" .
+		    " in request " . dump_bytes ($bytes));
+	$usage = "v";
+    };
+    $cacheable = ($maxage != 0);
+
+    $ok = 1;
+    if ($has_fallback)
+    {
+	if ($bytes =~
+	    /^req\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+(tts|url)\s+(\S+)\s+(tts|url)\s+(.*)$/s)
+	{
+	    $request_type = $1;
+	    $request_item = $2;
+	    $fallback_type = $3;
+	    $fallback_item = $4;
+	}
+	else
+	{
+	    $ok = 0;
+	};
+    }
+    else
+    {
+	if ($bytes =~ /^req\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+(tts|url)\s+(.*)$/s)
+	{
+	    $request_type = $1;
+	    $request_item = $2;
+	}
+	else
+	{
+	    $ok = 0;
+	};
+    };
+    if (! $ok)
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "invalid request: "
+		   . dump_bytes ($bytes) . ": bad full parse");
+	};
+	return;
+    };
+
+    ##  Compute primary path and hashname
+    ($ok, $msg, $httpreq, $hashname, $host) =
+      hc_request_to_params ($request_type, $request_item,
+			    $cookie_file, $postdata, $cacheable);
+    if (! $ok)
+    {
+	if ($::Loglevel >= LOG_EROR)
+	{
+	    logit (LOG_EROR, "invalid primary item in "
+		   . dump_bytes ($bytes) . ": $msg");
+	};
+	return;
+    };
+
+    ##  Compute fallback path and hashname
+    if ($has_fallback)
+    {
+	($ok, $msg, $fallback_httpreq, $fallback_hashname, $fallback_host) =
+	  hc_request_to_params
+	    ($fallback_type, $fallback_item, $cookie_file, $cacheable);
+	if (! $ok)
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "invalid fallback item in "
+		       . dump_bytes ($bytes) . ": $msg");
+	    };
+	    return;
+	};
+    };
+
+    ##  Construct $::Request_spec entry
+    $postdata =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+    $::Request_spec->{$request_id} = [];
+    push (@{$::Request_spec->{$request_id}},
+	  {"item" => $request_item,
+	   "httpreq" => $httpreq,
+	   "method" => $method,
+	   "postdata" => $postdata,
+	   "type" => $request_type,
+	   "audio" => (($usage eq "a") ? 1 : 0),
+	   "parsevxml" => (($usage eq "v") ? 1 : 0),
+	   "hashname" => $hashname,
+	   "host" => $host,
+	   "maxage" => $maxage,
+	   "lang" => $lang,
+	   "cookie_file" => $cookie_file,
+	   "timeout" => $timeout});
+    if ($has_fallback)
+    {
+	push (@{$::Request_spec->{$request_id}},
+	      {"item" => $fallback_item,
+	       "httpreq" => $fallback_httpreq,
+	       "method" => $method,
+	       "postdata" => $postdata,
+	       "type" => $fallback_type,
+	       "audio" => (($usage eq "a") ? 1 : 0),
+	       "parsevxml" => (($usage eq "v") ? 1 : 0),
+	       "hashname" => $fallback_hashname,
+	       "host" => $host,
+	       "maxage" => $maxage,
+	       "lang" => $lang,
+	       "cookie_file" => $cookie_file,
+	       "timeout" => $timeout});
+    };
+
+    ##  Process the top item in the Request_spec
+    process_next_request_item ($request_id);
+};
+
+##  run_http_cache ($cmd_fh);
+##    -- Runs the http cache process, communicating with the
+##       main voiceglue process over filehandle $cmd_fh.
+sub run_http_cache
+{
+    my ($cmd_fh) = shift (@_);
+    my (@events, $fh_spec, $fh, $datumlist, $datum, $input);
+    my ($ok, $msg, $timeout, $current_time, $bytes);
+    my ($cacheinfo, $hashname, $rec, $last_used, $time_to_free);
+    my Cam::Scom::Event $event;
+
+    ##  Don't let SIGPIPE kill me
+    $::SIG{"PIPE"} = "IGNORE";
+
+    ##  Create my own communication object and logging
+    setpgrp();
+    $::Dynlog_Mymodule = "HTTCACHE";
+    $::HC_Client_fh = $cmd_fh;
+    $::Clients->{$::HC_Client_fh} = {"type" => FHINFO_TYPE_SOUND_CACHE_CLIENT,
+				     "fh" => $::HC_Client_fh,
+				     "host" => "localhost"};
+    $::HC_Client_Fhinfo = $::Clients->{$::HC_Client_fh};
+    $::Scom = new Cam::Scom;
+    $::Logfile .= "-httpcache";
+    initialize_log();
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "http cache started");
+    };
+    ((($ok, $msg) = $::Scom->register ("$::HC_Client_fh+"))[0])
+      || fail ("Failure from Scom->register on $::HC_Client_fh: $msg");
+
+    ##  For curl's benefit, chdir to curl's drop location
+    chdir ("$::VgCacheDir/url")
+      || fail ("Cannot chdir to \"$::VgCacheDir/url\": $!");
+
+    $::Hashname_to_cacheinfo = {};
+    $::Request_spec = {};
+    $::Pid_to_hashname = {};
+
+    $::Next_cache_purge_time = time + $::Cache_purge_interval;
+
+    ##  Process events
+    while (1)
+    {
+	##  Start out assuming no timeout necessary
+	$current_time = time;
+	$timeout = -1;
+
+	##  If log server is disconnected, set a timeout
+	if (defined ($::Loghost) &&
+	    $::Time_of_next_connect_to_log_server && ($timeout == -1))
+	{
+	    $timeout = $::Time_of_next_connect_to_log_server - $current_time;
+	    ($timeout < 0) && ($timeout = 0);
+	};
+
+	##  Want to wake up once every 0.1 second to check
+	##  for terminated curls
+	(($timeout == -1) || ($timeout > 0.1)) && ($timeout = 0.1);
+
+	@events = $::Scom->getevents ($timeout);
+	$::Now = time;
+
+	##  Before handling requests, harvest any finished children
+	check_http_cache_children();
+
+	while (defined ($datumlist = shift (@events)))
+	{
+	    $fh = shift (@$datumlist);
+	    while (defined ($datum = shift (@$datumlist)))
+	    {
+		if ($fh eq $::Log_fh)
+		{
+		    ##  Got an event on the dynlog handle
+		    if (ref ($datum))
+		    {
+			##  Dynlog disconnected
+			$event = $datum;
+			logtofile (LOG_INFO,
+				   "dynlog server disconnected, code " .
+				   $event->{term},
+				   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+			$::Scom->unregister ($::Log_fh);
+			$::Time_of_next_connect_to_log_server =
+			  time +
+			    $::Interval_between_log_server_connect_attempts;
+		    }
+		    else
+		    {
+			##  Dynlog message - only one I recognize is
+			##  change in loglevel
+			foreach $input (split (//, $datum))
+			{
+			    $input = ord ($input);
+			    if (($input >= LOG_EMRG) && ($input <= LOG_DBUG))
+			    {
+				$::Loglevel = $input;
+			    };
+			};
+		    };
+		}
+		elsif ($fh eq $::HC_Client_fh)
+		{
+		    ##  Got an event on the command handle from voiceglue main
+		    if (ref ($datum))
+		    {
+			##  voiceglue main disconnected
+			$event = $datum;
+			logit (LOG_NOTI,
+			       "voiceglue main disconnected, code " .
+			       $event->{term});
+			return 0;
+		    }
+		    else
+		    {
+			##  message from voiceglue main
+			if ($::Loglevel >= LOG_DBUG)
+			{
+			    logit (LOG_DBUG, "rcv main: "
+				   . dump_bytes ($datum));
+			};
+
+			##  Handle the message
+			chomp ($datum);
+			handle_msg_from_voiceglue_main ($datum);
+		    };
+		}
+		else
+		{
+		    ##  WTF?  We just got a message on an unknown filehandle
+		    if ($::Loglevel >= LOG_EROR)
+		    {
+			logit (LOG_EROR,
+			       "rcv from UNKNOWN FILEHANDLE \"$fh\": \"" .
+			       $datum . "\"");
+		    };
+		};
+	    };
+	};
+
+	##  Check for cache purge
+	if ($::Now >= $::Next_cache_purge_time)
+	{
+	    $::Next_cache_purge_time = $::Now + $::Cache_purge_interval;
+	    if ($::Trace_cache && ($::Loglevel >= LOG_DBUG))
+	    {
+		logit (LOG_DBUG, "Running cache purge at " .
+		       $::Now . ", next purge at " .
+		       $::Next_cache_purge_time);
+	    };
+	    foreach $hashname (keys (%$::Hashname_to_cacheinfo))
+	    {
+		$cacheinfo = $::Hashname_to_cacheinfo->{$hashname};
+		$last_used = $cacheinfo->{"last_used"};
+		if ($cacheinfo->{"cacheable"})
+		{
+		    $time_to_free =
+		      (($last_used + $::Cache_purge_unused_time) < $::Now);
+		}
+		else
+		{
+		    $time_to_free =
+		      (($last_used + $::Cache_purge_uncacheable_unused_time)
+		       < $::Now);
+		};
+		if ($::Trace_cache && ($::Loglevel >= LOG_DBUG))
+		{
+		    logit (LOG_DBUG, "Cached item " . $hashname .
+			   " last used at " . $last_used .
+			   ", is" . ($rec->{"cacheable"} ? "" : " not") .
+			   " cacheable, is" .
+			   ($time_to_free ? "" : " not") . " time to free it");
+		};
+		if ($time_to_free)
+		{
+		    remove_cache_entry ($cacheinfo);
+		};
+	    };
+	};
+
+	##  Check for day rollover
+	if ((! defined ($::Last_day)) ||
+	    ($::Last_day != (localtime)[7]))
+	{
+	    log_new_day();
+	};
+
+	$current_time = time;
+	if ($::Time_of_next_connect_to_log_server &&
+	    ($::Time_of_next_connect_to_log_server <= $current_time))
+	{
+	    ##  Time for another log server connection attempt
+	    &opendynlog();
+	};
+    };
+};
+
+##  start_http_cache()
+##    -- Initializes HTTP Cache process.
+##       Dies with fail() on error.
+sub start_http_cache
+{
+    my ($http_cache_fh, $r, $ok, $msg, $pid);
+
+    ##  Create a new descriptor pair to communicate with the http cache
+    $::HC_fh = "::MAIN_TO_HC";
+    $http_cache_fh = "::HC_TO_MAIN";
+    no strict "refs";
+    $r = socketpair ($::HC_fh, $http_cache_fh,
+		     AF_UNIX, SOCK_STREAM, PF_UNSPEC);
+    use strict "refs";
+    $r || fail ("Unable to start http cache," .
+		" failure from socketpair(): $!");
+    $pid = fork();
+    defined ($pid)
+      || fail ("Fail from fork() on starting http cache: $!");
+    if ($pid == 0)
+    {
+	##  I am the child
+	no strict "refs";
+	close ($::HC_fh);
+	use strict "refs";
+	run_http_cache ($http_cache_fh);
+	exit (0);
+    };
+    ##  I am the parent
+    no strict "refs";
+    close ($http_cache_fh);
+    use strict "refs";
+    $::Clients->{$::HC_fh} = {"type" => FHINFO_TYPE_SOUND_CACHE,
+			      "fh" => $::HC_fh,
+			      "host" => "localhost"};
+    $::HC_fhinfo = $::Clients->{$::HC_fh};
+    $::Scom = new Cam::Scom;
+    ((($ok, $msg) = $::Scom->register ("$::HC_fh+"))[0])
+      || fail ("Failure from Scom->register on $::HC_fh: $msg");
+};
+
+##  stop_http_cache()
+##    -- Stops HTTP Cache process.
+sub stop_http_cache
+{
+    my ($ok, $msg);
+
+    ((($ok, $msg) = $::Scom->unregister ("$::HC_fh"))[0])
+      || logit (LOG_EROR, "Failure from Scom->unregister on $::HC_fh: $msg");
+};
+
+##  initialize_ctserver ()
+##    -- Initializes CT Server, aborts to fail() on error.
+sub initialize_ctserver
+{
+    my ($ok, $msg, $bytes, $satc_msg, $dnis, $load, $toself);
+
+    $::Satc = new Satc;
+
+    ##  Connect to the CT server
+    $::CTSrvInfo = {"type" => FHINFO_TYPE_CT_SERVER,
+		     "fh" => $::CTSrvFh,
+		     "host" => $::CT_host};
+    $::Clients->{$::CTSrvFh} = $::CTSrvInfo;
+    (($ok, $msg) =
+	$::Scom->connect ($::CTSrvFh, $::CT_host, $::CT_port,
+			".", 0))[0]
+	  || fail ("Cannot connect to CT Server at host $::CT_host: $msg");
+    defined ($::VgConfig->{"toself"})
+      && ($toself = $::VgConfig->{"toself"}[0]);
+    defined ($toself) || ($toself = "");
+    (($ok, $msg, $bytes) = $::Satc->encode
+     ({Satc::MSGTYPE => Satc::START,
+       Satc::TOSELF => $toself}))[0]
+	   || fail ("Encode error on Satc::START: $msg");
+    $::Scom->write ($::CTSrvFh, $bytes);
+    defined ($bytes = get_next_bytes ($::CTSrvFh))
+      || fail ("CT server disconnected in response to start");
+    (($ok, $msg, $satc_msg) = $::Satc->decode ($bytes))[0]
+      || fail ("Cannot parse CT server response to start \"" .
+	       dump_bytes ($bytes) . "\": $msg");
+    if ($satc_msg->{Satc::MSGTYPE} != Satc::STARTED)
+    {
+	fail ("Unrecognized SATC message received from CT server " .
+	      "in response to start: " .
+	      $::Satc->describe_msgtype ($satc_msg->{Satc::MSGTYPE}));
+    };
+    if ($satc_msg->{Satc::STATUS} != 0)
+    {
+	fail ("Failure from CT server in response to start: " .
+	      $satc_msg->{Satc::MSG});
+    };
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "Connected to CT server at $::CT_host")
+    };
+
+    ##  Register everything with the CT server
+    if (! defined ($::Reg))
+    {
+	##  Default, if not specified in config file, is to
+	##  register for all incoming calls
+	$::Reg = {"*" => 100};
+    };
+    foreach $dnis (keys (%{$::Reg}))
+    {
+	$load = $::Reg->{$dnis};
+	(($ok, $msg, $bytes) = $::Satc->encode
+	 ({Satc::MSGTYPE => Satc::REG,
+	   Satc::URL => $dnis,
+	   Satc::LOAD => $load}))[0]
+	       || fail ("Satc encode error on Satc::REG: $msg");
+	$::Scom->write ($::CTSrvFh, $bytes);
+	defined ($bytes = get_next_bytes ($::CTSrvFh))
+	  || fail ("CT server disconnected in response to reg");
+	(($ok, $msg, $satc_msg) = $::Satc->decode ($bytes))[0]
+	  || fail ("Cannot parse CT server response to reg \"" .
+		   dump_bytes ($bytes) . "\": $msg");
+	if ($satc_msg->{Satc::MSGTYPE} != Satc::REGED)
+	{
+	    fail ("Unrecognized SATC message received from CT server " .
+		  "in response to reg: " .
+		  $::Satc->describe_msgtype ($satc_msg->{Satc::MSGTYPE}));
+	};
+	if ($satc_msg->{Satc::STATUS} != 0)
+	{
+	    fail ("Failure from CT server in response to reg: " .
+		  $satc_msg->{Satc::MSG});
+	};
+	if ($::Loglevel >= LOG_NOTI)
+	{
+	    logit (LOG_NOTI,
+		   "Registered $dnis at load $load with CT server $::CT_host")
+	};
+    };
+
+    ##  Allow incoming calls from the CT server
+    (($ok, $msg, $bytes) =
+     $::Satc->encode ({Satc::MSGTYPE => Satc::ALLOWIN}))[0]
+       || fail ("Satc encode failure on Satc::ALLOWIN: $msg");
+    $::Scom->write ($::CTSrvFh, $bytes);
+    defined ($bytes = get_next_bytes ($::CTSrvFh))
+      || fail ("CT server disconnected in response to allowin");
+    (($ok, $msg, $satc_msg) = $::Satc->decode ($bytes))[0]
+      || fail ("Cannot parse CT server response to allowin \"" .
+	       dump_bytes ($bytes) . "\": $msg");
+    if ($satc_msg->{Satc::MSGTYPE} != Satc::ALLOWEDIN)
+    {
+	fail ("Unrecognized SATC message received from CT server " .
+	      "in response to allowin: " .
+	      $::Satc->describe_msgtype ($satc_msg->{Satc::MSGTYPE}));
+    };
+    if ($satc_msg->{Satc::STATUS} != 0)
+    {
+	fail ("Failure from CT server in response to allowin: " .
+	      $satc_msg->{Satc::MSG});
+    };
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI, "Allowed incoming calls from CT server at $::CT_host")
+    };
+};
+
+##  shutdown_ctserver ()
+##    -- Shuts down CT Server
+sub shutdown_ctserver
+{
+    my ($ok, $msg, $bytes, $satc_msg, $dnis, $load, $toself);
+
+    ##  Request disconnect from the CT server
+    (($ok, $msg, $bytes) = $::Satc->encode
+     ({Satc::MSGTYPE => Satc::STOP,
+       Satc::TOSELF => $toself}))[0]
+	   || fail ("Encode error on Satc::START: $msg");
+    $::Scom->write ($::CTSrvFh, $bytes);
+};
+
+##  initialize_cmd_listener ()
+##    -- Initializes command listener, aborts to fail() on error.
+sub initialize_cmd_listener
+{
+    my ($ok, $msg);
+    my ($listen_addr) = $::Cmd_host;
+    length($listen_addr) && ($listen_addr ne "*") || ($listen_addr = undef);
+
+    ##  Start up command port listener
+    (($ok, $msg) =
+     $::Scom->listen ($::CmdFh, $::Cmd_port, "::CMD", $listen_addr))[0]
+       || fail ("Cannot listen for CMD connections: $msg");
+    $::Clients->{$::CmdFh} = {"type" => FHINFO_TYPE_CMD_LISTENER,
+			      "fh" => $::CmdFh,
+			      "host" => $::Cmd_host};
+    $::CmdInfo = $::Clients->{$::CmdFh};
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "Listening for CMD connections at " .
+	       (defined ($listen_addr) ? $listen_addr : "*") .
+	       ":" . $::Cmd_port);
+    };
+};
+
+##  shutdown_cmd_listener ()
+##    -- Shuts down command listener.
+sub shutdown_cmd_listener
+{
+    my ($ok, $msg);
+
+    ##  Shut down command port listener
+    (($ok, $msg) =
+     $::Scom->unregister ($::CmdFh))[0]
+       || logit (LOG_EROR,
+		 "Cannot unregister listener for CMD connections: $msg");
+
+    if ($::Loglevel >= LOG_INFO)
+    {
+	logit (LOG_INFO, "Stopped listening for CMD connections");
+    };
+};
+
+##  $%param_map = build_urlmap()
+##    -- Creates $::URLmap from $::URL and $::Conffile, and returns
+##       $%param_map, which contains parameters from that file
+sub build_urlmap
+{
+    my ($ok, $msg);
+    my ($param_map);
+
+    ##  Build $::URLmap
+    if (defined ($::URL))
+    {
+	$::URLmap = {"*" => $::URL};
+    }
+    else
+    {
+	##  Parse config file for first time
+	(($ok, $msg, $param_map) = parse_configfile())[0]
+	  || fail ("Cannot parse config file \"$::Conffile\": $msg");
+    };
+    return $param_map;
+};
+
+##  read_configfile()
+##    -- Called only at program startup to initially parse the config file
+sub read_configfile
+{
+    my ($type, $cache_dir, @pwent);
+    my ($param, $value, $dnis, $load);
+    my ($config_params) = {
+			   "ast_sound_dir" => 1,
+			   "reg" => 0,
+			   "toself" => 0,
+			   "blind_xfer_method" => 0,
+			   "audio_fetch_retry" => 0,
+			   "audio_fetch_timeout" => 0,
+			   "audio_maxage" => 0,
+			   "cache_purge_interval" => 0,
+			   "cache_lastused_purge" => 0,
+			   "ssml_passthrough" => 0,
+			   "ignore_inputmode_errors" => 0,
+			   "default_vxml" => "",
+			  };
+
+    ##  Extract and verify required parameters
+    $::VgConfig = build_urlmap();
+    defined ($::AstSoundDir)
+      || defined ($::AstSoundDir = $::VgConfig->{"ast_sound_dir"}[0])
+	|| die ("Parameter ast_sound_dir not defined in " . $::Conffile .
+		" and not specified with --astsounddir command-line parameter");
+    $::VgCacheDir = join ("/", $::AstSoundDir, $::AstSoundPrefix);
+
+    (-d $::VgCacheDir)
+      || mkdir ($::VgCacheDir)
+	|| usage ("Bad ast_sound_dir or --astsounddir: " .
+		  $::AstSoundDir . " not present and cannot be made: $!");
+    foreach $type ("tts", "url", "rec", "link", "cookie")
+    {
+	$cache_dir = join ("/", $::VgCacheDir, "$type");
+	system ("rm", "-r", "-f", $cache_dir);
+	(-d $cache_dir)
+	  || mkdir ($cache_dir)
+	    || usage ("Cannot make http cache directory \"$cache_dir\": $!");
+	scalar (@pwent = stat ($cache_dir))
+	  || usage ("Cannot stat http cache directory $cache_dir: $!");
+	if (($pwent[4] != $::Ast_uid) ||
+	    (defined ($::Group_id) && ($pwent[5] != $::Group_id)))
+	{
+	    chown ($::Ast_uid,
+		   (defined ($::Group_id) ? $::Group_id : $pwent[5]),
+		   $cache_dir)
+	      || usage ("Cannot chown http cache directory $cache_dir: $!");
+	};
+	if (($pwent[2] & 0777) != 0775)
+	{
+	    chmod (0775, $cache_dir)
+	      || usage ("Cannot chmod $cache_dir: $!");
+	};
+    };
+
+    ##  Extract optional parameters
+    foreach $param (keys(%$::VgConfig))
+    {
+	if ($param eq "blind_xfer_method")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if ($value eq "dial")
+	    {
+		$::Blind_transfer_method = "dial";
+	    }
+	    elsif ($value eq "transfer")
+	    {
+		$::Blind_transfer_method = "transfer";
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "audio_fetch_retry")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if (($value =~ /^\d+$/) && ($value > 0))
+	    {
+		$::Retry_seconds_for_audio_fetch_failures = $value;
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "audio_fetch_timeout")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if (($value =~ /^\d+$/) && ($value > 0))
+	    {
+		$::Default_httpcache_fetch_timeout = $value;
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "audio_maxage")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if ($value =~ /^\d+$/)
+	    {
+		$::Default_httpcache_maxage = $value;
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "cache_purge_interval")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if (($value =~ /^\d+$/) && ($value > 0))
+	    {
+		$::Cache_purge_interval = $value;
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "cache_lastused_purge")
+	{
+	    $value = $::VgConfig->{$param}[0];
+	    if (($value =~ /^\d+$/) && ($value > 0))
+	    {
+		$::Cache_purge_unused_time = $value;
+	    }
+	    else
+	    {
+		if ($::Loglevel >= LOG_EROR)
+		{
+		    logit (LOG_EROR, "invalid parameter value \"" .
+			   $value .
+			   "\" in configuration file for parameter \"" .
+			   $param .
+			   "\", ignoring");
+		};
+	    };
+	}
+	elsif ($param eq "reg")
+	{
+	    foreach $value (@{$::VgConfig->{$param}})
+	    {
+		if ($value =~ /^(.+):(\d+)$/)
+		{
+		    $dnis = $1;
+		    $load = $2;
+		    if (! defined ($::Reg))
+		    {
+			$::Reg = {};
+		    };
+		    $::Reg->{$dnis} = $load;
+		}
+		else
+		{
+		    if ($::Loglevel >= LOG_EROR)
+		    {
+			logit (LOG_EROR, "invalid reg value \"" .
+			       $value . "\" in configuration file, ignoring");
+		    };
+		};
+	    };
+	}
+	elsif ($param eq "ssml_passthrough")
+	{
+	    if ($::VgConfig->{$param}[0])
+	    {
+		$::SSML_Passthrough = 1;
+	    };
+	}
+	elsif ($param eq "ignore_inputmode_errors")
+	{
+	    if ($::VgConfig->{$param}[0])
+	    {
+		$::Ignore_Inputmode_Errors = 1;
+	    };
+	}
+	elsif ($param eq "default_vxml")
+	{
+	    $::Default_vxml = $::VgConfig->{$param}[0];
+	    defined ($::Default_vxml) || ($::Default_vxml = "");
+	}
+	elsif (! defined ($config_params->{$param}))
+	{
+	    if ($::Loglevel >= LOG_EROR)
+	    {
+		logit (LOG_EROR, "unrecognized parameter \"" .
+		       $param . "\" in configuration file, ignoring");
+	    };
+	};
+    };
+};
+
+sub usage
+{
+    my ($message) = shift (@_);
+
+    $SIG{__DIE__} = "DEFAULT";
+
+    if ($message) {die ("voiceglue: " .  $message . "\n");};
+
+    die ("usage: voiceglue [--conffile conffile] [--url url] [--fg]
+\t\t[--astsoundprefix soundprefix] [--astsounddir sounddir] [--cmd host[:port]]
+\t\t[--cthost cthost] [--ctport ctport] [--user user] [--group group]
+\t\t[--loghost loghost] [--loglevel loglevel] [--logdir logdir]
+
+\t\tconffile defaults to /etc/voiceglue.conf and must be present
+\t\turl is a single VXML URL to use for all calls
+\t\t--fg means to run in the foreground (o.w. starts daemin)
+\t\tsoundprefix is directory under /var/lib/asterisk/sounds
+\t\t\tthat asterisk sees sound files created
+\t\t\tby this program (default 'voiceglue')
+\t\tsounddir is a local directory that asterisk sees at
+\t\t\t/var/lib/asterisk/sounds/<soundprefix>
+\t\t\t(default '/var/lib/asterisk/sounds/<prefix>'
+\t\tcthost is the SATC server to use (default 'localhost')
+\t\tctport is the SATC server port to use (default 44647)
+\t\tloghost is the dynlog server to connect to (no default)
+\t\tloglevel is initial loglevel 0-7 (default 7)
+\t\tlogdir is the log directory path
+\t\t\t(default '/var/tmp/voiceglue')
+\t\t\tlogdir of - means log to STDOUT\n");
+};
+
+##  parse_command_line_args()
+##    -- Does so, and aborts to usage() on errors
+sub parse_command_line_args
+{
+    my ($arg, $type, $cache_dir, $cmd_spec, @pwent, @astpwent);
+
+    ##  Get command line args
+    while (defined ($arg = shift (@::ARGV)))
+    {
+	if ($arg =~ /^--url$/)
+	{
+	    defined ($::URL = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^--co/)
+	{
+	    defined ($::Conffile = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^--astsoundp/)
+	{
+	    defined ($::AstSoundPrefix = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^--astsoundd/)
+	{
+	    defined ($::AstSoundDir = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^--cmd/)
+	{
+	    defined ($cmd_spec = shift (@::ARGV)) || usage();
+	    if ($cmd_spec =~ /^([^:]+):(\d+)$/)
+	    {
+		$::Cmd_host = $1;
+		$::Cmd_port = $2;
+	    }
+	    else
+	    {
+		$::Cmd_host = $cmd_spec;
+	    };
+	}
+	elsif ($arg =~ /^--cth/)
+	{
+	    defined ($::CT_host = shift (@::ARGV)) || usage();
+	    ($::CT_host =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^--ctp/)
+	{
+	    defined ($::CT_port = shift (@::ARGV)) || usage();
+	    ($::CT_port =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^--logh/)
+	{
+	    defined ($::Loghost = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^--logl/)
+	{
+	    defined ($::Loglevel = shift (@::ARGV)) || usage();
+	    ($::Loglevel =~ /^\d+$/) || usage();
+	    ($::Loglevel >= 0) && ($::Loglevel <= 7) || usage();
+	}
+	elsif ($arg =~ /^--logd/)
+	{
+	    defined ($::Log_dir = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg eq "--fg")
+	{
+	    $::Foreground = 1;
+	}
+	elsif ($arg eq "--valgrind")
+	{
+	    $::Valgrind = 1;
+	    $::Foreground = 1;
+	}
+	elsif ($arg =~ /^--user/)
+	{
+	    defined ($::User = shift (@::ARGV)) || usage();
+	    if ($::User =~ /^\d+$/)
+	    {
+		$::User_id = $::User;
+	    }
+	    else
+	    {
+		scalar (@pwent = getpwnam ($::User))
+		  || usage ("user \"$::User\" unknown");
+		$::User_id = $pwent[2];
+	    };
+	    defined ($::Group_id) || ($::Group_id = ($) + 0));
+	}
+	elsif ($arg =~ /^--group/)
+	{
+	    defined ($::Group = shift (@::ARGV)) || usage();
+	    if ($::Group =~ /^\d+$/)
+	    {
+		$::Group_id = $::Group;
+	    }
+	    else
+	    {
+		scalar (@pwent = getgrnam ($::Group))
+		  || usage ("group \"$::Group\" unknown");
+		$::Group_id = $pwent[2];
+	    };
+	    defined ($::User_id) || ($::User_id = $>);
+	}
+	else
+	{
+	    usage();
+	};
+    };
+
+    ##  Check that everything necessary was filled in, and apply defaults
+    defined ($::Conffile) || ($::Conffile = "/etc/voiceglue.conf");
+    defined ($::AstSoundPrefix) || ($::AstSoundPrefix = "voiceglue");
+    defined ($::CT_host) || ($::CT_host = "localhost");
+    defined ($::CT_port) || ($::CT_port = 44647);
+    defined ($::Loglevel) || ($::Loglevel = LOG_EROR);
+    $::Logfile = join ("/", $::Log_dir, "voiceglue");
+
+    scalar (@astpwent = getpwnam ("asterisk"))
+      || usage ("Cannot find \"asterisk\" account");
+    $::Ast_uid = $astpwent[2];
+
+};
+
+sub main
+{
+    my ($ok, $msg, $current_time, $timeout, $value, $max_fds, $pid);
+    my (@events, $fh_spec, $fh, $datumlist, $datum, $input, @pwent);
+    my ($pid_dir, $pid_file, $path, $rec, $new_fh, $config_file_path);
+    my ($new_default_vxml_line, $line, $replaced, @lines);
+    my Cam::Scom::Event $event;
+
+    ##  Don't let SIGPIPE kill me
+    $::SIG{"PIPE"} = "IGNORE";
+
+    $SIG{__DIE__} = sub { fail ($_[0]) };
+
+    ##  Compute inverse static maps
+    foreach $msg (keys (%$::OVXIMsgToOVXIType))
+    {
+	$value = $::OVXIMsgToOVXIType->{$msg};
+	$::OVXITypeToOVXIMsg->{$value} = $msg;
+    };
+
+    (($ok, $msg, $max_fds) = &increase_descriptors())[0]
+      || fail ("Cannot increase descriptors with setrlimit(): $msg");
+    (($ok, $msg) = &enable_core_dumps())[0]
+      || fail ("Cannot enable core dumps with setrlimit(): $msg");
+
+    ##  Fix umask
+    umask 0000;
+
+    ##  Would like to start log first, but need command line args
+    ##  and config file to configure it
+    parse_command_line_args();
+    read_configfile();
+
+    ##  Verify existence and ownership of log directory
+    if ($::Log_dir eq "-")
+    {
+	$::Logfile = "-";
+	$::Log_dir = "/var/tmp/voiceglue";
+    }
+    else
+    {
+	$::Logfile = join ("/", $::Log_dir, "voiceglue");
+    };
+    (-e $::Log_dir)
+      && (! (-d $::Log_dir))
+	&& system ("rm", "-r", "-f", $::Log_dir);
+    (-d $::Log_dir)
+      || mkdir ($::Log_dir)
+	|| usage ("Cannot mkdir log directory $::Log_dir: $!");
+    scalar (@pwent = stat ($::Log_dir))
+      || usage ("Cannot stat log directory $::Log_dir: $!");
+    if ((defined ($::User_id) && ($pwent[4] != $::User_id)) ||
+	(defined ($::Group_id) && ($pwent[5] != $::Group_id)))
+    {
+	chown ($::User_id, $::Group_id, $::Log_dir)
+	  || usage ("Cannot chown log directory $::Log_dir: $!");
+	foreach $path (glob("$::Log_dir/*"))
+	{
+	    chown ($::User_id, $::Group_id, $path)
+	      || usage ("Cannot chown log file $path: $!");
+	};
+    };
+
+    ##  Fork daemon
+    if (! defined ($::Foreground))
+    {
+	##  Verify existence of PID directory
+	$pid_dir = "/var/run/voiceglue";
+	$pid_file = join ("/", $pid_dir, "voiceglue.pid");
+	(-e $pid_dir)
+	  && (! (-d $pid_dir))
+	    && system ("rm", "-r", "-f", $pid_dir);
+	(-d $pid_dir)
+	  || mkdir ($pid_dir)
+	    || die ("Cannot mkdir pid directory $pid_dir: $!\n");
+	open (::FH, ">$pid_file")
+	  && (print ::FH ("\n"))
+	    && close (::FH)
+	      || die ("Cannot write pid file $pid_file: $!\n");
+
+	POSIX::setsid();
+	chdir ($::Log_dir)
+	  || usage ("Cannot cd to log directory $::Log_dir: $!");
+	close (STDIN);
+	if (! $::Valgrind)
+	{
+	    open (STDOUT, ">voiceglue_process.log")
+	      || usage ("Cannot open STDOUT to voiceglue_process.log" .
+			" for write: $!");
+	    open (STDERR, ">&STDOUT")
+	      || usage ("Cannot open STDERR dup to STDOUT: $!");
+	};
+	defined ($pid = fork())
+	  || usage ("Cannot fork: $!");
+	if ($pid)
+	{
+	    ##  Write the pidfile
+	    open (::FH, ">$pid_file")
+	      && (print ::FH ("$pid\n"))
+		&& close (::FH)
+		  || die ("Cannot write pid file $pid_file: $!\n");
+	    exit;
+	};
+    };
+
+    ##  Get SWISBSDK defined
+    if (! defined ($::ENV{"SWISBSDK"}))
+    {
+	$::ENV{"SWISBSDK"} = "/var/lib/openvxi-3.4";
+    };
+
+    ##  Set up default vxml file as specified in openvxi config file
+    if (length ($::Default_vxml))
+    {
+	$new_default_vxml_line = join ("   ",
+				       "client.vxi.defaultsURI",
+				       "VXIString",
+				       $::Default_vxml) . "\n";
+    };
+    $config_file_path =
+      join ("/", $::ENV{"SWISBSDK"}, "config", "SBclient.cfg");
+    open (::FH, $config_file_path) &&
+      scalar (@lines = <::FH>) &&
+	close (::FH)
+	  || die
+	    ("Cannot read openvxi config file $config_file_path: $!\n");
+    @lines = grep (! /^\s*client.vxi.defaultsURI/, @lines);
+    if (defined ($new_default_vxml_line))
+    {
+	push (@lines, $new_default_vxml_line);
+    };
+    open (::FH, ">$config_file_path") &&
+      (print ::FH (@lines)) &&
+	close (::FH)
+	  || die
+	    ("Cannot write openvxi config file $config_file_path: $!\n");
+
+    ##  Step down from root
+    if (defined ($::Group_id))
+    {
+	($), $() = ($::Group_id, $::Group_id);
+    };
+    if (defined ($::User_id))
+    {
+	($>, $<) = ($::User_id, $::User_id);
+    };
+
+    ##  Have to fork off http cache process before connecting to log
+    ##  This creates the $::Scom instance
+    start_http_cache();
+
+    ##  Have to do this after getting potential --loghost parameter
+    ##  from parse_command_line_args() and starting http cache
+    initialize_log();
+    if ($::Loglevel >= LOG_NOTI)
+    {
+	logit (LOG_NOTI,
+	       "voiceglue started with $max_fds available descriptors");
+    };
+
+    initialize_ovxi ($max_fds);
+
+    initialize_cmd_listener ();
+
+    initialize_ctserver ();
+
+    while (! $::Finished)
+    {
+	##  Start out assuming no timeout necessary
+	$current_time = time;
+	$timeout = -1;
+
+	##  If log server is disconnected, set a timeout
+	if (defined ($::Loghost) &&
+	    $::Time_of_next_connect_to_log_server && ($timeout == -1))
+	{
+	    $timeout = $::Time_of_next_connect_to_log_server - $current_time;
+	    ($timeout < 0) && ($timeout = 0);
+	};
+
+	##  Want to wake up once every minute to see if
+	##  the day has rolled over or if
+	##  cache expiry needs to run
+	($timeout < 60) && ($timeout = 60);
+
+	@events = $::Scom->getevents ($timeout);
+	$::Now = time;
+	while (defined ($datumlist = shift (@events)))
+	{
+	    $fh = shift (@$datumlist);
+	    while (defined ($datum = shift (@$datumlist)))
+	    {
+		if ($fh eq $::CTSrvFh)
+		{
+		    ##  Got an event from the CT server
+		    if (ref ($datum))
+		    {
+			##  CT server disconnected
+			$event = $datum;
+			fail ("CT server disconnected code " .
+				    $event->{term});
+		    }
+		    else
+		    {
+			##  Message from CT client
+			handle_msg_from_ct_server ($::CTSrvInfo, $datum);
+		    };
+		}
+		elsif ($fh eq $::Log_fh)
+		{
+		    ##  Got an event on the dynlog handle
+		    if (ref ($datum))
+		    {
+			##  Dynlog disconnected
+			logtofile (LOG_INFO,
+				   "dynlog server disconnected, code " .
+				   $event->{term},
+				   $::Dynlog_Mymodule, $::Dynlog_Mythread);
+			$::Scom->unregister ($::Log_fh);
+			$::Time_of_next_connect_to_log_server =
+			  time +
+			    $::Interval_between_log_server_connect_attempts;
+		    }
+		    else
+		    {
+			##  Dynlog message - only one I recognize is
+			##  change in loglevel
+			foreach $input (split (//, $datum))
+			{
+			    $input = ord ($input);
+			    if (($input >= LOG_EMRG) && ($input <= LOG_DBUG))
+			    {
+				$::Loglevel = $input;
+				if ($::Loglevel >= LOG_DBUG)
+				{
+				    Vxglue::_set_voiceglue_trace (1);
+				}
+				else
+				{
+				    Vxglue::_set_voiceglue_trace (0);
+				};
+			    };
+			};
+		    };
+		}
+		elsif ($fh eq $::VXILog_fh)
+		{
+		    ##  Got an event on the VXI log handle
+		    if (ref ($datum))
+		    {
+			##  VXIlog disconnected
+			logit (LOG_EROR,
+			       "VXIlog service disconnected, code " .
+			       $event->{term});
+			$::Scom->unregister ($::VXILog_fh);
+		    }
+		    else
+		    {
+			##  Forward VXIlog messages to generic logger
+			handle_vxilog_message ($datum);
+		    };
+		}
+		elsif ($fh eq $::HC_fh)
+		{
+		    ##  Got an event on the http cache handle
+		    if (ref ($datum))
+		    {
+			##  HTTP Cache disconnected
+			logit (LOG_EROR,
+			       "HTTP Cache disconnected, code " .
+			       $event->{term});
+			$::Scom->unregister ($::HC_fh);
+			$event = $datum;
+			fh_stopped ($fh, "code = " . $event->{term});
+		    }
+		    else
+		    {
+			handle_httpcache_message ($datum);
+		    };
+		}
+		elsif ($fh eq $::CmdFh)
+		{
+		    ##  Got an event on the Command Listener handle
+		    $event = $datum;
+		    if ($event->{end})
+		    {
+			fh_stopped ($fh, "code = " . $event->{term});
+		    }
+		    else
+		    {
+			##  Got a new command connection, register it
+			$new_fh = $event->{port};
+			if ($::Loglevel >= LOG_INFO)
+			{
+			    logit (LOG_INFO, "New CMD connection on fh = " .
+				   $new_fh);
+			};
+			$::Clients->{$new_fh} =
+			{
+			 "type" => FHINFO_TYPE_CMD,
+			 "fh" => $new_fh,
+			 "host" => four_byte_to_dot_separated
+			 ($event->{addr}),
+			};
+			(($ok, $msg) = $::Scom->register ("$new_fh+"))[0]
+			  || logit (LOG_EROR, $msg);
+		    };
+		}
+		elsif (defined ($fh_spec = $::Clients->{$fh}) &&
+		       ($fh_spec->{"type"} == FHINFO_TYPE_VXML_INTERP))
+		{
+		    ##  Got an event from a VXML interpreter
+
+		    if (ref ($datum))
+		    {
+			##  Handle VXML interpreter fh stoppages
+			$event = $datum;
+			fh_stopped ($fh, "code = " . $event->{term});
+		    }
+		    elsif ($fh_spec->{"type"} == FHINFO_TYPE_VXML_INTERP)
+		    {
+			##  Got a message from a VXML interpreter
+			handle_msg_from_vxml_interp ($fh_spec, $datum)
+		    }
+		    else
+		    {
+			##  WTF?  We just got a message on a filehandle
+			##  that wasn't of an excpected client type
+			if ($::Loglevel >= LOG_EROR)
+			{
+			    logit (LOG_EROR, "rcv from UNEXPECTED " .
+				   $::Fhinfo_type_description
+				   [$fh_spec->{"type"}] . "\"" . $fh .
+				   "\": \"" . $datum . "\"");
+			};
+		    };
+		}
+		elsif (defined ($fh_spec) &&
+		       ($fh_spec->{"type"} == FHINFO_TYPE_CMD))
+		{
+		    ##  Got an event on a Command handle
+		    if (ref ($datum))
+		    {
+			##  Command socket disconnected
+			logit (LOG_NOTI,
+			       "Command handle disconnected, code " .
+			       $event->{term});
+			$::Scom->unregister ($fh);
+		    }
+		    else
+		    {
+			##  Handle command messages
+			handle_command_message ($fh, $datum);
+		    };
+		}
+		else
+		{
+		    ##  WTF?  We just got a message on an unknown filehandle
+		    if ($::Loglevel >= LOG_EROR)
+		    {
+			logit (LOG_EROR,
+			       "rcv from UNKNOWN FILEHANDLE \"$fh\": \"" .
+			       $datum . "\"");
+		    };
+		};
+	    };
+	};
+
+	##  Check for day rollover
+	if ((! defined ($::Last_day)) ||
+	    ($::Last_day != (localtime)[7]))
+	{
+	    log_new_day();
+	};
+
+	$current_time = time;
+	if ($::Time_of_next_connect_to_log_server &&
+	    ($::Time_of_next_connect_to_log_server <= $current_time))
+	{
+	    ##  Time for another log server connection attempt
+	    &opendynlog();
+	};
+    };
+
+    shutdown_ctserver ();
+
+    shutdown_cmd_listener ();
+
+    if (! $::Valgrind)
+    {
+	shutdown_ovxi();
+    };
+
+    stop_http_cache();
+
+    shutdown_log();
+
+    undef $::Scom;
+};
+
+main();
+
+# use Cam::Form qw(format);
+# @::Stuff =
+#   hc_request_to_params ("url", "http://foo.com/blah.vxml", "/tmp/empty", "", 1# );
+# print ::STDOUT (&format (@::Stuff));
+# @::Stuff =
+#   hc_request_to_params ("tts", "Four fine frogs, fine friends!", "", "", 1);
+# print ::STDOUT (&format (@::Stuff));
+
+
+# use Cam::Form qw(format);
+# @::Res = parse_speak_xml ("<?xml version='1.0'?><speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:base='http://10.7.27.136:8080/brain/ivr/eonivr/RMexAut' xml:lang='it-IT'><voice name=\"Paola\">Questo è il menù principale.  Premi 1 per accedere al test menu.   Premi 2 per chiudere la chiamata.  Premi 3 per accedere al test load Premi 4 per accedere al test di trasferta. Premi 5 per accedere al test della form.  Premi 6 per accedere al test di open url. Premi 7 per accedere al test esse esse emme elle.</voice></speak>");
+# print ::STDOUT (&format (@::Res));
+# @::Res = parse_speak_xml ("<?xml version='1.0'?><speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:base='http://candide1.plumgroup.com/candide/cs/index.vxml' xml:lang='en'><audio src=\"wav/connecting.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\">Connecting</audio></speak>");
+# @::Res = parse_speak_xml ("<?xml version='1.0'?><speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:base='http://www.talkingstreet.com/ivr/cs/index.vxml' xml:lang='en'><audio src=\"wav/main1.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\">To hear one of our celebrity narrated tours, Press 1</audio><audio src=\"wav/main2.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\">To listen to sample stops from our Talking Street Tours, press 2</audio><audio src=\"wav/main3.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\">To speak to a customer service representative, press 3</audio></speak>");
+# @::Res = parse_speak_xml ("<?xml version=\'1.0\'?><speak version=\'1.0\' xmlns=\'http://www.w3.org/2001/10/synthesis\' xml:base=\'http://www.talkingstreet.com/ivr/ver_no_dir/vxml/welcome.php' xml:lang=\'en\'><audio src=\"wav/Soundmark.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\" maxage=\"0\"/><audio src=\"WDC/WDC_Welcome.wav\" fetchtimeout=\"7s\" fetchhint=\"prefetch\" maxage=\"0\">\n\x90\x90\x90\x90\x90Welcome to \"Boston: City of Rebels and Dreamers,\" a Talking Street cell-phone walking tour narrated by Steven Tyler.\n\x90\x90\x90\x90</audio></speak>");
+##  Pretty-printed:
+# <?xml version='1.0'?>
+# <speak version='1.0'
+#        xmlns='http://www.w3.org/2001/10/synthesis'
+#        xml:base='http://www.talkingstreet.com/ivr/ver_no_dir/vxml/welcome.php'
+#        xml:lang='en'>
+#     <audio src="wav/Soundmark.wav"
+#            fetchtimeout="7s"
+#            fetchhint="prefetch"
+#            maxage="0"/>
+#     <audio src="WDC/WDC_Welcome.wav"
+#            fetchtimeout="7s"
+#            fetchhint="prefetch"
+#            maxage="0">
+#     \n\x90\x90\x90\x90\x90Welcome to "Boston: City of Rebels and Dreamers," a Talking Street cell-phone walking tour narrated by Steven Tyler.\n\x90\x90\x90\x90
+#     </audio>
+# </speak>
+
+# use Cam::Form qw(format);
+# print ::STDOUT ("Result: ", &format (@::Res), "\n");
+
+sub fakemain
+{
+    my ($ok, $msg, $platform_handle, $call_handle);
+
+    (($ok, $msg, $platform_handle) =
+     Vxglue::_start_voiceglue_platform (1024))[0]
+      || die ("Failure from start_voiceglue_platform: $msg");
+    (($ok, $msg, $call_handle) =
+     Vxglue::_start_voiceglue_thread
+     ($platform_handle, 1001,
+      "http://localhost/vxml/welcome.vxml",
+      "9789735994",
+      "9785551212", ""))[0]
+	|| die ("Failure from start_voiceglue_thread: $msg");
+    sleep (5);
+    (($ok, $msg) =
+     Vxglue::_stop_voiceglue_thread ($call_handle))[0]
+       || die ("Failure from stop_voiceglue_thread: $msg");
+    (($ok, $msg) =
+     Vxglue::_stop_voiceglue_platform ($platform_handle))[0]
+       || die ("Failure from stop_voiceglue_platform: $msg");
+};
+
+# print STDOUT ("Run!\n");
+# callVXImain (["RunVXID", "-url", "http://localhost/vxml/welcome.vxml"]);
+# fakemain();
+
+# VXIrecLoadGrammarFromString called with type "text/x-grammar-choice-dtmf", grammar "<rule id="digit" scope="public"><one-of><item> 0 </item><item> 1 </item><item> 2 </item><item> 3 </item><item> 4 </item><item> 5 </item><item> 6 </item><item> 7 </item><item> 8 </item><item> 9 </item></one-of></rule>"
+
+
+__END__

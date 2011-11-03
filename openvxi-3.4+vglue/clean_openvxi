@@ -1,0 +1,84 @@
+#!/usr/bin/perl -- -*-CPerl-*-
+
+##  Cleans openvxi+vglue for voiceglue
+
+use strict;
+
+sub main
+{
+    ##  Read params
+    $::Family = shift (@::ARGV);
+    # $::Release = shift (@::ARGV);
+    # $::Major = shift (@::ARGV);
+    # $::Minor = shift (@::ARGV);
+    # $::Arch = shift (@::ARGV);
+
+    ##  Set environment variables for openvxi compilation
+    chomp ($::ENV{"SWISBSDK"} = `pwd`);
+    $::ENV{"XERCESDIR"} = "/usr";
+    $::ENV{"SPIDERMONKEYDIR"} = "/usr";
+    $::ENV{"SYSTYPE"} = $::Family;
+
+    ##  Compile each component
+    chdir ("src") || die ("Cannot cd to src: $!");
+
+    chdir ("VXIinterfaces") || die ("Cannot cd to VXIinterfaces: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("swichar") || die ("Cannot cd to swichar: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("value") || die ("Cannot cd to value: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("trd") || die ("Cannot cd to trd: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("log") || die ("Cannot cd to log: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("cache") || die ("Cannot cd to cache: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("inet") || die ("Cannot cd to inet: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("jsi") || die ("Cannot cd to jsi: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("VXI") || die ("Cannot cd to VXI: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("VXIclient") || die ("Cannot cd to VXIclient: $!");
+    system ("make", "clean");
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    chdir ("..") || die ("Cannot cd to ..: $!");
+
+    system ("rm", "-r", "-f",
+	    "config",
+	    "lib",
+	    "bin",
+	    "include/SBlogInternal.h",
+	    "include/VXIvximain.h",
+	    "src/inet/build",
+	    "src/swichar/build",
+	    "src/log/build",
+	    "src/cache/build",
+	    "src/VXIclient/build",
+	    "src/jsi/build",
+	    "src/VXI/build",
+	    "src/trd/build",
+	    "src/value/build");
+}
+
+main();

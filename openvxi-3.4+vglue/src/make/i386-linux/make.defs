@@ -1,0 +1,215 @@
+# Copyright 2004 Vocalocity, Inc.  All rights reserved.
+#
+# Makefile macros for SWI source code directories
+#  on i386-linux platform
+#
+
+# Copyright 2004 Vocalocity, Inc.
+# All Rights Reserved
+#
+#
+# Makefile macros for Vocalocity program source code directories
+#
+#
+
+SHELL = /bin/sh
+
+#----------------------------------------------------------------------
+# Platform Macros
+#----------------------------------------------------------------------
+OS=linux
+CPU=i386
+PLATFORM = $(CPU)-$(OS)
+MAKE_CPU = $(CPU)
+MAKE_OS = $(OS)
+PERL = $(shell which perl)
+
+ifndef MAKEFILE
+MAKEFILE = Makefile
+endif
+
+#----------------------------------------------------------------------
+# Directories
+#----------------------------------------------------------------------
+PWD := $(shell pwd)
+BUILD_ROOT := build
+BUILD_ROOT_PLT = $(BUILD_ROOT)/$(PLATFORM)
+BUILDDIR = $(BUILD_ROOT_PLT)/$(CFG)
+PLATFORMDIR = $(PROJ_ROOT)/$(PLATFORM)
+SRCPATH = $(PLATFORMDIR)/src
+
+#----------------------------------------------------------------------
+# SWISBSDK Install Directories
+#----------------------------------------------------------------------
+bindir = $(SWISBSDK)/bin
+libdir = $(SWISBSDK)/lib
+incdir = $(SWISBSDK)/include
+
+#----------------------------------------------------------------------
+# Build Area directories
+#----------------------------------------------------------------------
+buildbindir = $(BUILDDIR)/bin
+buildlibdir = $(BUILDDIR)/lib
+
+#----------------------------------------------------------------------
+# C/C++ compiler flags
+#----------------------------------------------------------------------
+CC = gcc
+CXX = g++
+
+CFLAGS_GENERAL = \
+      -D_$(CPU)_ \
+	    -D_$(OS)_ \
+	    -I$(PROJ_ROOT)/$(PLATFORM)/include \
+	    -I$(PROJ_ROOT)/include \
+	    -I$(SWISBSDK)/include \
+
+ANSIFLAGS = \
+      -pedantic \
+	    -Wall \
+	    -Wcast-qual \
+	    -Wcast-align \
+	    -Wmissing-prototypes \
+	    -Wstrict-prototypes \
+	    -Wtraditional
+
+C_ANSIFLAGS = $(ANSIFLAGS) -Wid-clash-31
+CXX_ANSIFLAGS = $(ANSIFLAGS)
+
+ifdef STRICT
+CFLAGS_GENERAL += $(ANSIFLAGS)
+endif
+
+# -g     debug symbols
+# -O0 	 No Optimization for debug
+# -fPIC  Generate Position Independant code
+CFLAGS_DEBUG = -g -O0 -fPIC
+
+# -s     strip symbols
+# -O2    Optimize for release
+# -fPIC  Generate Position Independant code
+CFLAGS_RELEASE = -DNDEBUG -s -O2 -fPIC
+
+#----------------------------------------------------------------------
+# Link Flags
+#----------------------------------------------------------------------
+LDFLAGS += -L$(buildlibdir) $(PROJ_LDFLAGS) $($(TARGET)_LDFLAGS) $(LDFLAGS_$(OS)) -L$(SWISBSDK)/lib
+LDFLAGS_SHARED = -shared
+LDLIBS += $($(TARGET)_LDLIBS)
+ifdef STATIC
+LDLIBS += $($(TARGET)_LDLIBS_STATIC)
+endif
+
+# With GCC 3.0.2, we have to link statically with both libstdc++.a and
+# libgcc.a and specify that we don't want the compiler to link with
+# the default libraries.
+ifeq ("$(EXTERNAL_BUILD)", "1")
+GCC_LIBS = -Wl,-Bstatic,-lstdc++,-lgcc,-Bdynamic -lc -lm -nodefaultlibs
+else
+GCC_LIBS = -lstdc++
+endif
+LDLIBS += $(GCC_LIBS)
+
+# Set defaults for the library version and product name burnt into
+# shared libraries
+ifndef LIBVER
+LIBVER = 3
+endif
+
+#LIBPROD = OSB
+LIBPROD = $(PRODUCT_LIB_PREFIX)
+
+#----------------------------------------------------------------------
+# General Programs
+#----------------------------------------------------------------------
+CHMOD = chmod
+CHMODFLAGS = go-w,a-x
+CHMODFLAGSX = go-w,a+x
+INSTALL = cp -p
+INSTALL_PROGRAM = $(INSTALL)
+INSTALL_DATA = $(INSTALL)
+MKDIRS = $(SWISBSDK)/src/make/i386-linux/mkinstalldirs
+RMDIR = rmdir
+RMCLEAN = rm -rf
+
+#----------------------------------------------------------------------
+# Set up macros for different config's
+#----------------------------------------------------------------------
+ifdef NOT_THREADED
+IS_THREADED=0
+else
+IS_THREADED=1
+endif
+
+ifeq ("$(IS_THREADED)","1")
+CFLAGS_GENERAL += -D__THREADED
+endif
+
+ifndef CFG
+CFG = debug
+$(message CFG not defined. Defaulting to debug.)
+endif
+
+ifeq ("$(CFG)","debug")
+CFG_SUFFIX = D
+CFLAGS_CFG = $(CFLAGS_DEBUG)
+else
+ifeq ("$(CFG)","release")
+CFG_SUFFIX =
+CFLAGS_CFG = $(CFLAGS_RELEASE)
+else
+$(error CFG is not a legal type - should be debug or release)
+endif
+endif
+
+#----------------------------------------------------------------------
+# Final Values
+#----------------------------------------------------------------------
+CFLAGS = $(CFLAGS_CFG) $(CFLAGS_GENERAL) $(MYCFLAGS)
+CXXFLAGS = $(CFLAGS_CFG) $(CFLAGS_GENERAL) $(MYCFLAGS)
+CPPFLAGS = $(PROJ_CFLAGS) $(CFLAGS_$(OS)) $($(TARGET)_CFLAGS)
+
+#----------------------------------------------------------------------
+# C/C++ Platform Specific Compiler Flags
+#----------------------------------------------------------------------
+CC = gcc
+CXX = g++
+
+#----------------------------------------------------------------------
+# ANSIFLAGS are blank unless you want the general make rules flags
+# Comment out these if you want the defaults. Add with += if needed
+#----------------------------------------------------------------------
+#ANSIFLAGS += 
+#C_ANSIFLAGS += 
+
+#----------------------------------------------------------------------
+# Add any Platform Specific CFLAGS 
+#----------------------------------------------------------------------
+CFLAGS_GENERAL += -D_SIMPLE_R \
+	          -D_REENTRANT \
+	          -D_GNU_SOURCE
+
+#----------------------------------------------------------------------
+# CPPFLAGS for any specific platform. Uncomment and add with +=
+#----------------------------------------------------------------------
+#CPPFLAGS +=
+
+#----------------------------------------------------------------------
+# Platform Specific Linker Flags
+#----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
+# LDFLAGS - SWISBSDK/lib is already included. Add as necessary 
+#----------------------------------------------------------------------
+LDFLAGS += -Wl,-rpath-link=$(SWISBSDK)/lib:$(PROJ_RPATH_LINK)
+
+#----------------------------------------------------------------------
+# LDLIBS is set primarily in the Makefiles for the necessary linkage
+# Additional Platform specific if needed - rest are from main make.defs
+#----------------------------------------------------------------------
+LDLIBS += -lpthread -ldl
+
+#----------------------------------------------------------------------
+# Platform Specific INSTALL Program - default is the general make.defs
+# override with your own INSTALL if necessary (default is "cp -p")
+#----------------------------------------------------------------------

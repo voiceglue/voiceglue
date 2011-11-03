@@ -1,0 +1,86 @@
+#!/usr/bin/perl --        -*-CPerl-*-
+
+use Cwd;
+use File::Copy;
+
+use strict;
+
+##  uninstall_executable (executable_name)
+sub uninstall_executable
+{
+    my ($executable_name) = shift (@_);
+
+    unlink ("/usr/bin/$executable_name");
+};
+
+##  uninstall_perl_module (directory, module_name)
+sub uninstall_perl_module
+{
+    my ($module_dir) = shift (@_);
+    my ($module_name) = shift (@_);
+    my ($start_dir) = getcwd;
+
+    system ("doc/perl_modrm", $module_name)
+      && die ("Failed running \"doc/perl_modrm $module_name\"" .
+	      " to uninstall perl module \"$module_name\": $!");
+};
+
+sub uninstall_openvxi
+{
+    my ($start_dir) = getcwd;
+    my ($openvxi_dir) = "openvxi-3.4+vglue";
+    chdir ($openvxi_dir)
+      || die ("Cannot chdir to \"$openvxi_dir\" to uninstall openvxi: $!" );
+    system ("./uninstall_openvxi")
+      && die ("Failed running \"./uninstall_openvxi\" in \"$openvxi_dir\"" .
+	      " to uninstall openvxi: $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after uninstalling openvxi: $! ");
+};
+
+sub uninstall_with_make
+{
+    my ($pkg_dir) = shift (@_);
+    my ($start_dir) = getcwd;
+    my ($makefile) = "Makefile." . $::Dist;
+    chdir ($pkg_dir)
+      || die ("Cannot chdir to \"$pkg_dir\" to uninstall: $!" );
+    if (! -f $makefile)
+    {
+	$makefile = "Makefile";
+    };
+    system ("make", "-f", $makefile, "uninstall")
+      && die ("Failed running \"make uninstall\" in \"$pkg_dir\": $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after uninstalling $pkg_dir: $!");
+};
+
+sub main
+{
+    ##  Determine distribution
+    if (-f "/etc/redhat-release")
+    {
+	$::Dist = "redhat";
+    }
+    elsif (-f "/etc/debian_version")
+    {
+	$::Dist = "debian";
+    }
+    else
+    {
+	die ("Error: unrecognized linux distribution\n");
+    };
+
+    uninstall_with_make ("voiceglue");
+    uninstall_perl_module ("Vxglue", "Vxglue");
+    uninstall_with_make ("libvglue");
+    uninstall_openvxi();
+    uninstall_perl_module ("SRGSDTMF", "SRGSDTMF");
+    uninstall_with_make ("phoneglue");
+    uninstall_perl_module ("Voiceglue-Conf", "Voiceglue::Conf");
+    uninstall_perl_module ("Satc", "Satc");
+    uninstall_with_make ("dynlog");
+    uninstall_perl_module ("Cam-Scom", "Cam::Scom");
+};
+
+main();

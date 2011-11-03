@@ -1,0 +1,16 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		OSBinetCreateResource;
+		OSBinetDestroyResource;
+		OSBinetInit;
+		OSBinetShutDown;
+		SBinetCreateResource;
+		SBinetDestroyResource;
+		SBinetInit;
+		SBinetShutDown;
+		SBinetInitEx;
+	local:
+	  *;
+	};
+}

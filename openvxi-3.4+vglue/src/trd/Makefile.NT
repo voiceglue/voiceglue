@@ -1,0 +1,132 @@
+#
+#/****************License************************************************
+# * Vocalocity OpenVXI
+# * Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+# * This program is free software; you can redistribute it and/or
+# * modify it under the terms of the GNU General Public License
+# * as published by the Free Software Foundation; either version 2
+# * of the License, or (at your option) any later version.
+# *  
+# * This program is distributed in the hope that it will be useful,
+# * but WITHOUT ANY WARRANTY; without even the implied warranty of
+# * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# * GNU General Public License for more details.
+# *
+# * You should have received a copy of the GNU General Public License
+# * along with this program; if not, write to the Free Software
+# * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+# * Vocalocity, the Vocalocity logo, and VocalOS are trademarks or 
+# * registered trademarks of Vocalocity, Inc. 
+# * OpenVXI is a trademark of Scansoft, Inc. and used under license 
+# * by Vocalocity.
+# ***********************************************************************/
+#
+#**********************************************************************
+#
+# swichar, Vocalocity thread library
+# NT make file 
+#
+#
+#**********************************************************************/
+
+#--------------------------------
+# Required Environment Variables
+#--------------------------------
+
+!ifndef SWISBSDK
+!error The environment variable SWISBSDK is not defined (it should point to your baseline directory).
+!endif
+
+# By default, set PRODUCT_LIB_PREFIX to SB
+!if "$(PRODUCT_LIB_PREFIX)" == ""
+!message PRODUCT_LIB_PREFIX not defined. Defaulting to SB
+PRODUCT_LIB_PREFIX = SB
+!endif
+
+#--------------------------------
+# Project specific settings
+#--------------------------------
+PROJ_ROOT = ..
+BUILDSUBDIRS =
+PUBLIC_HEADERS = \
+	trdUtil\SBtrdMutex.hpp \
+	trdUtil\SBtrdRefCount.hpp \
+	trdUtil\SBtrdEvent.hpp \
+	trdUtil\SBtrdTimeOfDay.hpp
+
+PUBLIC_SCRIPTS =
+
+# if want to use recursive mutex, define VXITRD_RECURSIVE_MUTEX
+# notes: recursive is complicated at portablibilty
+PROJ_CFLAGS = \
+!if defined(VXITRD_RECURSIVE_MUTEX)
+ 	-DVXITRD_RECURSIVE_MUTEX \
+	-DVXITRD_KERNEL_MUTEX \
+!endif
+	 -DCOMPANY_DOMAIN=L\"com.vocalocity\" \
+	 -DMODULE_PREFIX=L\"swi:\"
+
+# Suppress using a *.def file to define exports from DLLs, use the
+# SYMBOL_EXPORT_DECL definition from VXIheaderPrefix.h instead
+NO_DEF_FILES = 1
+
+#--------------------------------
+# Static libraries
+#--------------------------------
+LIBS = 
+
+#--------------------------------
+# Dynamic libraries
+#--------------------------------
+DLLS = $(PRODUCT_LIB_PREFIX)trd $(PRODUCT_LIB_PREFIX)trdUtil
+
+$(PRODUCT_LIB_PREFIX)trd_OBJS = \
+	$(BUILDDIR)/SBtrd.obj \
+  $(BUILDDIR)/SBtrd.res
+
+$(PRODUCT_LIB_PREFIX)trd_LIBS =
+
+$(PRODUCT_LIB_PREFIX)trdUtil_OBJS = \
+	$(BUILDDIR)/SBtrdMutex.obj \
+	$(BUILDDIR)/SBtrdRefCount.obj \
+	$(BUILDDIR)/SBtrdEvent.obj \
+	$(BUILDDIR)/SBtrdTimeOfDay.obj \
+  $(BUILDDIR)/SBtrdUtil.res
+
+$(PRODUCT_LIB_PREFIX)trdUtil_LIBS = \
+	$(PRODUCT_LIB_PREFIX)char$(CFG_SUFFIX).lib \
+	$(PRODUCT_LIB_PREFIX)trd$(CFG_SUFFIX).lib
+
+#-------------------------------------
+# Programs
+#-------------------------------------
+PROGS =
+
+#--------------------------------------------
+# Include the common def's and config logic
+#--------------------------------------------
+!include "..\make\i386-win32\make.defs"
+
+#------------------------------------------------
+# Targets
+#------------------------------------------------
+all : $(LIBS) $(DLLS) $(PROGS)
+
+#---------------------------------------------
+# Include some rules common to all makefiles
+#---------------------------------------------
+
+!include "..\make\i386-win32\make.rules"
+	
+#---------------------
+# Inference rules
+#---------------------
+
+{trdUtil}.c{$(BUILDDIR)}.obj:
+        $(CC) $(CFLAGS) -c $<
+
+{trdUtil}.cpp{$(BUILDDIR)}.obj:
+        $(CC) $(CPPFLAGS) -c $<
+
+{trdUtil}.rc{$(BUILDDIR)}.res:
+        $(RC) $(RFLAGS) /r $<

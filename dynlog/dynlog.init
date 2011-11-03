@@ -1,0 +1,119 @@
+#!/bin/sh
+#
+# dynlog    Starts, Stops and Reloads Dynlog.
+#
+# chkconfig: 2345 91 59
+# description: Dynlog dynamic log aggregator
+# processname: dynlog
+# pidfile: /var/run/dynlog.pid
+#
+
+### BEGIN INIT INFO
+# Provides:          dynlog
+# Required-Start:    $network
+# Required-Stop:     $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: start dynlog daemon
+### END INIT INFO
+
+DYNLOG_BIN="/usr/bin"
+DYNLOG_USER="dynlog"
+DYNLOG_GROUP="dynlog"
+
+# Source function library, determine system type
+SYSTYPE="unknown"
+if [ -f /etc/redhat-release ] ; then
+	SYSTYPE="redhat"
+	. /etc/rc.d/init.d/functions
+fi
+if [ -f /etc/debian_version ] ; then
+	SYSTYPE="debian"
+	. /lib/lsb/init-functions
+fi
+
+if ! [ -x $DYNLOG_BIN/dynlog ] ; then
+	echo "ERROR: $DYNLOG_BIN/dynlog not found"
+	exit 0
+fi
+
+# Full path to dynlog binary
+DAEMON=$DYNLOG_BIN/dynlog
+PIDDIR=/var/run/dynlog
+PIDFILE=$PIDDIR/dynlog.pid
+
+RETVAL=0
+
+start() {
+	# Start daemons.
+	if [ "$SYSTYPE" = "redhat" ]; then
+		echo -n $"Starting dynlog: "
+		if [ $DYNLOG_USER ] ; then
+			DYNLOGARGS="-U $DYNLOG_USER"
+		fi
+		if [ $DYNLOG_GROUP ] ; then
+			DYNLOGARGS="$DYNLOGARGS -G $DYNLOG_GROUP"
+		fi
+		daemon $DAEMON $DYNLOGARGS
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] && touch /var/lock/subsys/dynlog
+		echo
+		return $RETVAL
+	fi
+	if [ "$SYSTYPE" = "debian" ]; then
+		log_daemon_msg "Starting Dynlog daemon"
+		log_progress_msg "dynlog"
+		if ! start-stop-daemon --start --pidfile $PIDFILE --quiet --oknodo --exec $DAEMON -- $DYNLOGARGS; then
+			log_end_msg 1
+			exit 1
+		fi
+		log_end_msg 0
+	fi
+}
+
+stop() {
+	# Stop daemons.
+	if [ "$SYSTYPE" = "redhat" ]; then
+		echo -n $"Shutting down dynlog: "
+		killproc dynlog
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/dynlog
+		echo
+		return $RETVAL
+	fi
+	if [ "$SYSTYPE" = "debian" ]; then
+		log_daemon_msg "Stopping Dynlog daemon"
+		log_progress_msg "dynlog"
+		start-stop-daemon --stop --quiet --pidfile $PIDFILE
+		# Wait a little and remove stale PID file
+		sleep 1
+		if [ -f $PIDFILE ] && ! ps h `cat $PIDFILE` > /dev/null
+		then
+			rm -f $PIDFILE
+		fi
+		log_end_msg 0
+	fi
+}
+
+restart() {
+	stop
+	start
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart)
+	restart
+	;;
+  *)
+	echo "Usage: dynlog {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

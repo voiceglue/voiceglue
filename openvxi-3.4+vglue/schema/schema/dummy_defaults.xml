@@ -1,0 +1,7 @@
+<?xml version="1.0" ?>
+<!DOCTYPE defaults PUBLIC "SB_Defaults" "ignore" >
+<defaults xml:lang="en">
+  <language id="*">
+    <meta name="maintainer" content="SpeechWorks International"/>
+  </language>
+</defaults>

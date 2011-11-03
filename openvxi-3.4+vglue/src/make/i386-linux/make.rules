@@ -1,0 +1,300 @@
+# Copyright 2004 Vocalocity, Inc.
+# All Rights Reserved
+#
+# Makefile rules for SWI source code directories
+#  on i386-linux platform
+#
+
+#----------------------------------------------------------------------
+# List of all sources and source directories
+#----------------------------------------------------------------------
+all_SRC := $(sort $(foreach target, $(PROGS) $(STATIC_LIBS) $(LIBS), $($(target)_SRC)))
+progsubdirs := $(sort ./ $(foreach target, $(PROGS), $(dir $($(target)_SRC))))
+libsubdirs := $(sort ./ $(foreach target, $(STATIC_LIBS) $(LIBS), $(dir $($(target)_SRC))))
+
+#----------------------------------------------------------------------
+# Header file and Include Directories
+#----------------------------------------------------------------------
+vpath lib%.a $(patsubst -L%, %, $(filter -L%, $(LDFLAGS))) \
+	      $(subst :, , $(LD_LIBRARY_PATH)) $(STD_LIBRARY_PATH)
+
+ifneq ($(SRCPATH),)
+vpath %.c $(SRCPATH)
+vpath %.cc $(SRCPATH)
+vpath %.cpp $(SRCPATH)
+vpath %.C $(SRCPATH)
+vpath %.def $(SRCPATH)
+vpath %.f $(SRCPATH)
+vpath %.F $(SRCPATH)
+vpath %.l $(SRCPATH)
+vpath %.mod $(SRCPATH)
+vpath %.p $(SRCPATH)
+vpath %.r $(SRCPATH)
+vpath %.s $(SRCPATH)
+vpath %.sh $(SRCPATH)
+vpath %.y $(SRCPATH)
+endif
+
+#----------------------------------------------------------------------
+# Show targets prints a list of available targets
+#----------------------------------------------------------------------
+show-targets:
+	@echo Binaries available in this Makefile are:
+ifneq ($(STATIC_LIBS),)
+	@echo Static libraries \(.a\): $(addprefix lib,$(STATIC_LIBS))
+endif
+ifneq ($(LIBS),)
+	@echo Libraries \(.a or .so\): $(addprefix lib,$(LIBS))
+endif
+ifneq ($(PROGS),)
+	@echo Executables : $(PROGS)
+endif
+	@echo Options are: 
+	@echo    all-static builds with Static libs
+	@echo    all-shared builds with Shared libs 
+	@echo    - read additional details in the README
+
+#----------------------------------------------------------------------
+# Clean Targets
+#----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
+# .PHONY target declares all possible rules
+#----------------------------------------------------------------------
+.PHONY: $(PROGS) $(STATIC_LIBS) $(LIBS) \
+	$(addsuffix -shared, $(STATIC_LIBS) $(LIBS)) \
+	$(addsuffix -static, $(STATIC_LIBS) $(LIBS)) \
+	$(addsuffix -install, $(STATIC_LIBS) $(LIBS) $(PROGS)) \
+	$(addsuffix -install-static, $(STATIC_LIBS) $(LIBS)) \
+	$(addsuffix -install-shared, $(STATIC_LIBS) $(LIBS)) \
+	$(addsuffix -install-progs, $(PROGS)) \
+	$(buildbindir)/installprogsubdirs $(buildlibdir)/installlibsubdirs \
+	installbuildbindir installbuildlibdir \
+	installbindir installlibdir \
+	all progs libs-static libs-shared \
+	all-libs all-static all-shared \
+	all-install headers clean \
+	$(LOCAL1) $(LOCAL2) $(LOCAL3)
+
+all: show-targets
+
+all-static: $(LOCAL1) $(addsuffix -install-static, $(STATIC_LIBS) $(LIBS)) \
+	    $(LOCAL2) $(addsuffix -install, $(PROGS)) $(LOCAL3)
+
+all-shared: $(LOCAL1) $(addsuffix -install-static, $(STATIC_LIBS)) \
+	    $(addsuffix -install-shared, $(LIBS)) \
+	    $(LOCAL2) $(addsuffix -install, $(PROGS)) $(LOCAL3)
+
+progs: $(addsuffix -progs, $(PROGS))
+
+libs: libs-static libs-shared
+
+libs-static: $(addsuffix -static, $(STATIC_LIBS) $(LIBS))
+
+libs-shared: $(addsuffix -static, $(STATIC_LIBS)) $(addsuffix -shared, $(LIBS))
+
+#----------------------------------------------------------------------
+# headers copies all the public headers and scripts to the build area
+#         (normally automatically done when a library, DLL, or program is 
+#         successfully build)
+#----------------------------------------------------------------------
+headers: installincdir
+ifneq ($(PUBLIC_HEADERS),)
+	$(INSTALL) $(PUBLIC_HEADERS) $(incdir)
+endif
+ifneq ($(PUBLIC_HEADER_TREES),)
+	$(INSTALL) -r $(PUBLIC_HEADER_TREES) "$(SWISBSDK)/include"
+endif
+ifneq ($(PUBLIC_SCRIPTS),)
+	$(INSTALL) $(PUBLIC_SCRIPTS) "$(SWISBSDK)/bin"
+endif
+ifneq ($(PUBLIC_CONFIG_FILES),)
+	$(INSTALL) $(PUBLIC_CONFIG_FILES) "$(SWISBSDK)/config"
+endif
+ifneq ($(PUBLIC_ERROR_FILES),)
+	$(INSTALL) $(PUBLIC_ERROR_FILES) "$(SWISBSDK)/config"
+endif
+
+#----------------------------------------------------------------------
+# clean deletes the entire directory tree for the current build config
+#----------------------------------------------------------------------
+clean: $(PROJ_CLEAN)
+	$(RMCLEAN) $(BUILDDIR)
+	@echo Cleaning up $(BUILDDIR)
+
+#----------------------------------------------------------------------
+# Rules to create (install) build subdirs
+#----------------------------------------------------------------------
+$(buildbindir)/installbinsubdirs:
+	$(MKDIRS) $(addprefix $(dir $@), $(progsubdirs))
+	-$(CHMOD) $(CHMODFLAGSX) $(addprefix $(dir $@), $(progsubdirs))
+
+$(buildlibdir)/installlibsubdirs:
+	$(MKDIRS) $(addprefix $(dir $@), $(libsubdirs))
+	-$(CHMOD) $(CHMODFLAGSX) $(addprefix $(dir $@), $(libsubdirs))
+
+installbuildbindir:
+	$(MKDIRS) $(buildbindir)
+	-$(CHMOD) $(CHMODFLAGSX) $(buildbindir)
+
+installbuildlibdir:
+	$(MKDIRS) $(buildlibdir)
+	-$(CHMOD) $(CHMODFLAGSX) $(buildlibdir)
+
+installbindir:
+	$(MKDIRS) $(bindir)
+	-$(CHMOD) $(CHMODFLAGSX) $(bindir)
+
+installlibdir:
+	$(MKDIRS) $(libdir)
+	-$(CHMOD) $(CHMODFLAGSX) $(libdir)
+
+installincdir:
+	$(MKDIRS) $(incdir)
+	-$(CHMOD) $(CHMODFLAGSX) $(incdir)
+
+#----------------------------------------------------------------------
+# Targets - 
+#----------------------------------------------------------------------
+$(addsuffix -install, $(PROGS)): %-install: installbindir %-progs
+	$(RM) $(bindir)/$*$(CFG_SUFFIX)
+	$(INSTALL_PROGRAM) $(buildbindir)/$*$(CFG_SUFFIX) $(bindir)
+
+$(addsuffix -install, $(STATIC_LIBS) $(LIBS)): %-install: %-install-static %-install-shared
+
+$(addsuffix -install-static, $(STATIC_LIBS) $(LIBS)): %-install-static: installlibdir \
+	                               %-static headers
+	$(RM) $(libdir)/lib$*$(CFG_SUFFIX).a
+	$(INSTALL_DATA) $(buildlibdir)/lib$*$(CFG_SUFFIX).a $(libdir)
+
+$(addsuffix -install-shared, $(LIBS)): %-install-shared: installlibdir \
+	                               %-shared headers
+	$(RM) $(libdir)/lib$*$(CFG_SUFFIX).so.$(LIBVER)
+	$(INSTALL_DATA) $(buildlibdir)/lib$*$(CFG_SUFFIX).so.$(LIBVER) $(libdir)
+	$(RM) $(libdir)/lib$*$(CFG_SUFFIX).so
+	ln -s lib$*$(CFG_SUFFIX).so.$(LIBVER) $(libdir)/lib$*$(CFG_SUFFIX).so
+
+#----------------------------------------------------------------------
+# Program Targets
+#----------------------------------------------------------------------
+$(PROGS): %: %-progs
+
+$(addsuffix -progs, $(PROGS)): %-progs: installbuildbindir \
+	            $(buildbindir)/installbinsubdirs
+	$(MAKE) -f $(MAKEFILE) $(buildbindir)/$*$(CFG_SUFFIX) TARGET=$* \
+	DEPS=$*_SRC
+
+#----------------------------------------------------------------------
+# Library Targets
+#----------------------------------------------------------------------
+$(STATIC_LIBS): %: %-static %-shared
+
+$(LIBS): %: %-static %-shared
+
+$(addsuffix -static, $(STATIC_LIBS) $(LIBS)): %-static: installbuildlibdir \
+		     $(buildlibdir)/installlibsubdirs
+	$(MAKE) -f $(MAKEFILE) $(buildlibdir)/lib$*$(CFG_SUFFIX).a TARGET=$* \
+	DEPS=$*_SRC
+
+ifdef NO_DEF_FILES
+BUILDVER = 
+endif
+ifdef EXPLICIT_DEF_FILES
+BUILDVER = $(PERL) $(SWISBSDK)/make/bin/def_to_ver.pl $(OS) $(LIBPROD) $(LIBVER) $($*_DEF) $(buildlibdir)/$(patsubst %.def,%.ver,$(notdir $($*_DEF)))
+endif
+
+$(addsuffix -shared, $(LIBS)): %-shared: installbuildlibdir \
+		     $(buildlibdir)/installlibsubdirs 
+	$(BUILDVER)
+	$(MAKE) -f $(MAKEFILE) $(buildlibdir)/lib$*$(CFG_SUFFIX).so TARGET=$* \
+	DEPS=$*_SRC
+
+#----------------------------------------------------------------------
+# Recursive rules
+#----------------------------------------------------------------------
+$(addprefix $(buildbindir)/, $(addsuffix $(CFG_SUFFIX), $(PROGS))): \
+	    $(addprefix $(buildbindir)/, \
+	      $(patsubst %.s, %$(CFG_SUFFIX).o, $(filter %.s, $($(DEPS)))) \
+	      $(patsubst %.c, %$(CFG_SUFFIX).o, $(filter %.c, $($(DEPS)))) \
+	      $(patsubst %.cc, %$(CFG_SUFFIX).o, $(filter %.cc, $($(DEPS)))) \
+	      $(patsubst %.cpp, %$(CFG_SUFFIX).o, $(filter %.cpp, $($(DEPS)))) \
+	      $(patsubst %.C, %$(CFG_SUFFIX).o, $(filter %.C, $($(DEPS)))))
+	      $(LINK.cc) $(filter %$(CFG_SUFFIX).o, $^) -o $@ $(LDLIBS) $(PROJ_LDLIBS) $(LDLIBS_$(OS))
+	      -$(CHMOD) $(CHMODFLAGSX) $@
+
+$(addprefix $(buildlibdir)/, $(patsubst %, lib%$(CFG_SUFFIX).a, $(STATIC_LIBS) $(LIBS))): \
+	    $(addprefix $(buildlibdir)/, \
+	      $(patsubst %.s, %$(CFG_SUFFIX).o, $(filter %.s, $($(DEPS)))) \
+	      $(patsubst %.c, %$(CFG_SUFFIX).o, $(filter %.c, $($(DEPS)))) \
+	      $(patsubst %.cc, %$(CFG_SUFFIX).o, $(filter %.cc, $($(DEPS)))) \
+	      $(patsubst %.cpp, %$(CFG_SUFFIX).o, $(filter %.cpp, $($(DEPS)))) \
+	      $(patsubst %.C, %$(CFG_SUFFIX).o, $(filter %.C, $($(DEPS)))))
+	$(RM) $@
+	$(AR) $(ARFLAGS) $@ $^
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(addprefix $(buildlibdir)/, $(patsubst %, lib%$(CFG_SUFFIX).so, $(LIBS))): \
+	    $(addprefix $(buildlibdir)/, \
+	      $(patsubst %.s, %$(CFG_SUFFIX).o, $(filter %.s, $($(DEPS)))) \
+	      $(patsubst %.c, %$(CFG_SUFFIX).o, $(filter %.c, $($(DEPS)))) \
+	      $(patsubst %.cc, %$(CFG_SUFFIX).o, $(filter %.cc, $($(DEPS)))) \
+	      $(patsubst %.cpp, %$(CFG_SUFFIX).o, $(filter %.cpp, $($(DEPS)))) \
+	      $(patsubst %.C, %$(CFG_SUFFIX).o, $(filter %.C, $($(DEPS)))))
+
+	$(LINK.cc) $(LDFLAGS_SHARED) $(filter %$(CFG_SUFFIX).o, $^) -o $@.$(LIBVER) $(LDLIBS)
+	-$(CHMOD) $(CHMODFLAGSX) $@.$(LIBVER)
+	$(RM) $@
+	ln -s $(patsubst $(buildlibdir)/%,%, $@).$(LIBVER) $@
+
+#----------------------------------------------------------------------
+# Object File compilation Rules
+#----------------------------------------------------------------------
+$(buildbindir)/%$(CFG_SUFFIX).o: %.c
+	$(COMPILE.c)  $(addprefix ${PWD}/,$<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildbindir)/%$(CFG_SUFFIX).o: %.cc
+	$(COMPILE.cc)  $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildbindir)/%$(CFG_SUFFIX).o: %.cpp
+	$(COMPILE.cc)  $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildbindir)/%$(CFG_SUFFIX).o: %.C
+	$(COMPILE.C)  $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildlibdir)/%$(CFG_SUFFIX).o: %.c
+	$(COMPILE.c)  $(addprefix ${PWD}/, $<) -o $@ 
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildlibdir)/%$(CFG_SUFFIX).o: %.cc
+	$(COMPILE.cc) $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildlibdir)/%$(CFG_SUFFIX).o: %.cpp
+	$(COMPILE.cc) $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildlibdir)/%$(CFG_SUFFIX).o: %.C
+	$(COMPILE.C)  $(addprefix ${PWD}/, $<) -o $@
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+$(buildlibdir)/%$(CFG_SUFFIX).o: %.s
+	$(AS) $(ASFLAGS) -o $@ $<
+	-$(CHMOD) $(CHMODFLAGS) $@
+
+#----------------------------------------------------------------------
+# Additional LDFLAGS rules 
+#----------------------------------------------------------------------
+ifdef NO_DEF_FILES
+LDEXPORTS =
+endif
+ifdef EXPLICIT_DEF_FILES
+LDEXPORTS = --version-script $(buildlibdir)/$(patsubst %.def,%.ver, $(notdir $($(TARGET)_DEF)))
+endif
+ifndef BUILDING_STUB_SO
+LDFOLLOWLINKS = -Wl,-h,$(notdir $@).$(LIBVER)
+endif
+LDFLAGS_SHARED += $(LDEXPORTS) $(LDFOLLOWLINKS)

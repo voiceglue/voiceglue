@@ -1,0 +1,11 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		VXIinterpreterCreateResource;
+		VXIinterpreterDestroyResource;
+		VXIinterpreterInit;
+		VXIinterpreterShutDown;
+	local:
+	  *;
+	};
+}

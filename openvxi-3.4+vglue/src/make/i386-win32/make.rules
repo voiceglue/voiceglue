@@ -1,0 +1,272 @@
+# PRODUCT_DOC
+#
+# Copyright 2004 Vocalocity, Inc. All Rights Reserved.
+#
+# Make rules that are common to all NT make files
+#
+# Used by: all NT make files
+#
+#
+
+!if !defined(DEPS)
+
+#====================================================================
+# clean deletes the entire directory tree for the current build config
+#====================================================================
+clean : $(PROJ_CLEAN)
+        -rmdir /s /q $(BUILDDIR)
+
+#====================================================================
+# show-targets prints a list of available targets
+#====================================================================
+show-targets :
+	@echo Binaries available in this makefile are:
+!if "$(LIBS)" != ""
+	@echo Static libraries : $(LIBS)
+!endif
+!if "$(DLLS)" != ""
+	@echo Dynamic libraries : $(DLLS)
+!endif
+!if "$(PROGS)" != ""
+	@echo Executables : $(PROGS)
+!endif
+
+#====================================================================
+# depends generates a file depends.mak which contains header dependencies
+#         for the source files in the tree.
+#====================================================================
+depends :
+	@-$(MAKE) -nologo -a $(MAKEFLAGS) -f $(MAKEFILE) CFG=$(CFG) MYCFLAGS=-P
+	@if exist $(BUILDDIR)\depends.mak del $(BUILDDIR)\depends.mak
+	@echo -- Generating $(BUILDDIR)\depends.mak
+	@-for %%q in (*.i) do @(type %%q | $(MAKE_ROOT:/=\)\i386-win32\gendeps >> $(BUILDDIR)\depends.mak) && del %%q
+
+#====================================================================
+# headers copies all the public headers and scripts to the build area
+#         (normally automatically done when a library, DLL, or program is 
+#         successfully build)
+#====================================================================
+headers :
+!if "$(PUBLIC_HEADERS)" != ""
+	for %%x in ($(PUBLIC_HEADERS)) do @copy %%x "$(SWISBSDK)\include" > NUL
+!endif
+!if "$(PUBLIC_HEADER_TREES)" != ""
+	-for %%x in ($(PUBLIC_HEADER_TREES)) do @robocopy /S %%x "$(SWISBSDK)\include" *.h *.hpp /XD CVS > NUL
+!endif
+!if "$(PUBLIC_SCRIPTS)" != ""
+	for %%x in ($(PUBLIC_SCRIPTS)) do @copy %%x "$(SWISBSDK)\bin" > NUL
+!endif
+!if "$(PUBLIC_CONFIG_FILES)" != ""
+	for %%x in ($(PUBLIC_CONFIG_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+!if "$(PUBLIC_ERROR_FILES)" != ""
+	for %%x in ($(PUBLIC_ERROR_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+
+#====================================================================
+# MAKEDIRLIST creates the directory tree needed for the current build config
+#====================================================================
+$(MAKEDIRLIST:/=\) :
+        @if not exist "$@\nul" mkdir "$@"
+        @echo Created directory: $@
+
+#====================================================================
+# Recursive rule for LIB targets - spawns an nmake for each LIB target
+#====================================================================
+!if "$(LIBS)" != ""
+$(LIBS) : $(MAKEDIRLIST)
+        @$(MAKE) -nologo -$(MAKEFLAGS) -f $(MAKEFILE) CFG=$(CFG) \
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).lib" \
+!if defined(BROWSE)
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).bsc" \
+!endif
+        TARGET_BASENAME=$@ TARGET="$(BUILDDIR)\$@$(CFG_SUFFIX)" \
+	      TARGET_TYPE=LIB DEPS=$$^($@_OBJS^) TARGET_LIBS=$$^($@_LIBS^)
+!endif
+
+#====================================================================
+# Recursive rule for DLL targets - spawns an nmake for each DLL target
+#====================================================================
+!if "$(DLLS)" != ""
+$(DLLS) : $(MAKEDIRLIST)
+        @$(MAKE) -nologo -$(MAKEFLAGS) -f $(MAKEFILE) CFG=$(CFG) \
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).dll" \
+!if defined(BROWSE)
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).bsc" \
+!endif
+        TARGET_BASENAME=$@ TARGET="$(BUILDDIR)\$@$(CFG_SUFFIX)" \
+	      TARGET_TYPE=DLL DEPS=$$^($@_OBJS^) TARGET_LIBS=$$^($@_LIBS^) \
+!if defined(EXPLICIT_DEF_FILES)
+	      TARGET_DEF=$$^($@_DEF^)
+!else
+	      TARGET_DEF=$(PLATFORMDIR)/src/$@.def
+!endif
+!endif
+
+#====================================================================
+# Recursive rule for PROGS targets - spawns an nmake for each PROGS target
+#====================================================================
+!if "$(PROGS)" != ""
+$(PROGS) : $(MAKEDIRLIST)
+        @$(MAKE) -nologo -$(MAKEFLAGS) -f $(MAKEFILE) CFG=$(CFG) \
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).exe" \
+!if defined(BROWSE)
+        "$(BUILDDIR)\$@$(CFG_SUFFIX).bsc" \
+!endif
+        TARGET_BASENAME=$@ TARGET="$(BUILDDIR)\$@$(CFG_SUFFIX)" \
+	      TARGET_TYPE=PROG DEPS=$$^($@_OBJS^) TARGET_LIBS=$$^($@_LIBS^)
+!endif
+
+!else # DEPS is defined so use the second half of the file instead
+
+!if exist ("$(BUILDDIR)/depends.mak")
+!include "$(BUILDDIR)/depends.mak"
+!endif
+
+# do some error checking
+
+!if "$(DEPS)" == ""
+!error DEPS is NULL. Did you define $(TARGET_BASENAME)_OBJS correctly?
+!endif
+
+#====================================================================
+# Build rule for LIB targets - used inside the recursion
+#====================================================================
+!if "$(TARGET_TYPE)" == "LIB"
+
+$(TARGET).lib : $(DEPS)
+        $(LIBRARIAN) $(LIBRARIAN_FLAGS) @<<
+$(DEPS)
+<<NOKEEP
+	copy $(TARGET).lib "$(SWISBSDK)\lib\$(TARGET_BASENAME)$(CFG_SUFFIX).lib" > NUL
+!if "$(CFG)" == "debug"	
+	copy $(TARGET).pdb "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).pdb" > NUL
+!endif
+!if "$(PUBLIC_HEADERS)" != ""
+	for %%x in ($(PUBLIC_HEADERS)) do @copy %%x "$(SWISBSDK)\include" > NUL
+!endif
+!if "$(PUBLIC_HEADER_TREES)" != ""
+	-for %%x in ($(PUBLIC_HEADER_TREES)) do @robocopy /S %%x "$(SWISBSDK)\include" *.h *.hpp /XD CVS > NUL
+!endif
+!if "$(PUBLIC_SCRIPTS)" != ""
+	for %%x in ($(PUBLIC_SCRIPTS)) do @copy %%x "$(SWISBSDK)\bin" > NUL
+!endif
+!if "$(PUBLIC_CONFIG_FILES)" != ""
+	for %%x in ($(PUBLIC_CONFIG_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+!if "$(PUBLIC_ERROR_FILES)" != ""
+    for %%x in ($(PUBLIC_ERROR_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+
+#====================================================================
+# Build rule for DLL targets - used inside the recursion
+#====================================================================
+!elseif "$(TARGET_TYPE)" == "DLL"
+
+!if "$(NO_DEF_FILES)" == ""
+DEPS = $(DEPS) $(PLATFORMDIR)\src\$(TARGET_BASENAME).def
+!endif
+
+$(TARGET).dll : $(DEPS)
+        $(LNK) $(LNKFLAGS) $(LNKFLAGS_DLL) @<<
+$(DEPS)
+<<NOKEEP
+	copy $(TARGET).dll "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).dll" > NUL
+!if "$(CFG)" == "debug"
+	copy $(TARGET).pdb "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).pdb" > NUL
+	copy $(TARGET).map "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).map" > NUL
+!endif
+	copy $(TARGET).lib "$(SWISBSDK)\lib\$(TARGET_BASENAME)$(CFG_SUFFIX).lib" > NUL
+!if "$(PUBLIC_HEADERS)" != ""
+	for %%x in ($(PUBLIC_HEADERS)) do @copy %%x "$(SWISBSDK)\include" > NUL
+!endif
+!if "$(PUBLIC_HEADER_TREES)" != ""
+	-for %%x in ($(PUBLIC_HEADER_TREES)) do @robocopy /S %%x "$(SWISBSDK)\include" *.h *.hpp /XD CVS > NUL
+!endif
+!if "$(PUBLIC_SCRIPTS)" != ""
+	for %%x in ($(PUBLIC_SCRIPTS)) do @copy %%x "$(SWISBSDK)\bin" > NUL
+!endif
+!if "$(PUBLIC_CONFIG_FILES)" != ""
+	for %%x in ($(PUBLIC_CONFIG_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+!if "$(PUBLIC_ERROR_FILES)" != ""
+    for %%x in ($(PUBLIC_ERROR_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+
+#====================================================================
+# Build rule for PROG targets - used inside the recursion
+#====================================================================
+!elseif "$(TARGET_TYPE)" == "PROG"
+
+$(TARGET).exe : $(DEPS)
+        $(LNK) $(LNKFLAGS) $(LNKFLAGS_CONSOLE) @<<
+$(DEPS)
+<<NOKEEP
+	copy $(TARGET).exe "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).exe" > NUL
+!if "$(CFG)" == "debug"
+	copy $(TARGET).pdb "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).pdb" > NUL
+	copy $(TARGET).map "$(SWISBSDK)\bin\$(TARGET_BASENAME)$(CFG_SUFFIX).map" > NUL
+!endif
+!if "$(PUBLIC_HEADERS)" != ""
+	for %%x in ($(PUBLIC_HEADERS)) do @copy %%x "$(SWISBSDK)\include" > NUL
+!endif
+!if "$(PUBLIC_HEADER_TREES)" != ""
+	-for %%x in ($(PUBLIC_HEADER_TREES)) do @robocopy /S %%x "$(SWISBSDK)\include" *.h *.hpp /XD CVS > NUL
+!endif
+!if "$(PUBLIC_SCRIPTS)" != ""
+	for %%x in ($(PUBLIC_SCRIPTS)) do @copy %%x "$(SWISBSDK)\bin" > NUL
+!endif
+!if "$(PUBLIC_CONFIG_FILES)" != ""
+	for %%x in ($(PUBLIC_CONFIG_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+!if "$(PUBLIC_ERROR_FILES)" != ""
+    for %%x in ($(PUBLIC_ERROR_FILES)) do @copy %%x "$(SWISBSDK)\config" > NUL
+!endif
+
+!endif # $(TARGET_TYPE)
+
+
+!if defined(BROWSE)
+$(TARGET).bsc : $(DEPS:.obj=.sbr)
+        @echo ** Generating browse info: $@
+	-dir $(BUILDDIR)\*.sbr /b /s > zzqq153x.rsp
+	-bscmake $(BROWSE_FLAGS) @zzqq153x.rsp
+	-del zzqq153x.rsp
+!endif
+
+#====================================================================
+# Common inference rules needed inside the recursion
+#====================================================================
+.SUFFIXES: .cpp .mc .rc .idl
+
+.c.obj:
+        $(CC) $(CFLAGS) $<
+
+.c{$(BUILDDIR)}.obj:
+        $(CC) $(CFLAGS) $<
+
+.cpp.obj:
+        $(CC) $(CPPFLAGS) $<
+
+.cpp{$(BUILDDIR)}.obj:
+        $(CC) $(CPPFLAGS) $<
+
+.mc{$(BUILDDIR)}.rc:
+        mc $(MFLAGS) $<
+
+.rc{$(BUILDDIR)}.res:
+        $(RC) $(RFLAGS) /r $<
+
+.idl{$(BUILDDIR)}.tlb:
+	$(MTL) /tlb "$@" /h "$(*B).h" /iid "$*_i.c" $(MTLFLAGS) $<
+
+{$(PLATFORMDIR)/src}.c{$(BUILDDIR)}.obj:
+        $(CC) $(CFLAGS) $<
+
+{$(PLATFORMDIR)/src}.cpp{$(BUILDDIR)}.obj:
+        $(CC) $(CPPFLAGS) $<
+
+{$(PLATFORMDIR)/src}.rc{$(BUILDDIR)}.res:
+        $(RC) $(RFLAGS) /r $<
+
+!endif # DEPS

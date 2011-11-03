@@ -1,0 +1,37 @@
+VERSION {
+	OSB_3.0 {
+	global:
+	  SWIatof;
+	  SWIatofloat;
+	  SWIwcstof;
+	  SWIwtof;
+	  SWIstrtowcs;
+	  SWIwcstostr;
+	  SWIitowcs;
+	  SWIdtowcs;
+	  SWIdtostr;
+	  SWIwcstod;
+	  SWIwcstoi;
+	  SWIwtoi;
+	  SWIwcsstrcmp;
+	  SWIisascii;
+	  SWIisvalid_unicode;
+	  SWIislatin1;
+	  SWIutf8towcslen;
+	  SWIutf8towcs;
+	  SWIwcstoutf8;
+	  SWIwcstoutf8len;
+	  SWIvsprintf;
+	  SWIvswprintf;
+	  SWIfgetws;
+	  SWIfprintf;
+	  SWIfwprintf;
+	  SWIsprintf;
+	  SWIswprintf;
+	  SWIwcstok;
+	  SWIstrtok;
+	  SWIcharReturnCodeToWcs;
+	local:
+	  *;
+	};
+}

@@ -1,0 +1,7 @@
+#!/bin/bash
+
+RUNDIR=/var/lib/openvxi-3.4
+cd /usr/lib
+rm -f `cat $RUNDIR/lib_manifest`
+cd /usr/include
+rm -f `cat $RUNDIR/inc_manifest`

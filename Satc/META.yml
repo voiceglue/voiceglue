@@ -1,0 +1,22 @@
+---
+abstract: 'Simple ASCII Telephony Control'
+author:
+  - 'Doug Campbell <soup@ampersand.com>'
+build_requires:
+  ExtUtils::CBuilder: 0
+  Test::More: 0
+configure_requires:
+  Module::Build: 0.36
+generated_by: 'Module::Build version 0.3603'
+license: gpl
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: Satc
+provides:
+  Satc:
+    file: lib/Satc.pm
+    version: 0.12
+resources:
+  license: http://opensource.org/licenses/gpl-license.php
+version: 0.12

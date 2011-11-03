@@ -1,0 +1,176 @@
+#
+#/****************License************************************************
+# * Vocalocity OpenVXI
+# * Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+# * This program is free software; you can redistribute it and/or
+# * modify it under the terms of the GNU General Public License
+# * as published by the Free Software Foundation; either version 2
+# * of the License, or (at your option) any later version.
+# *  
+# * This program is distributed in the hope that it will be useful,
+# * but WITHOUT ANY WARRANTY; without even the implied warranty of
+# * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# * GNU General Public License for more details.
+# *
+# * You should have received a copy of the GNU General Public License
+# * along with this program; if not, write to the Free Software
+# * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+# * Vocalocity, the Vocalocity logo, and VocalOS are trademarks or 
+# * registered trademarks of Vocalocity, Inc. 
+# * OpenVXI is a trademark of Scansoft, Inc. and used under license 
+# * by Vocalocity.
+# ***********************************************************************/
+#
+#**********************************************************************
+#
+# SBjsi, Vocalocity JavaScript interpreter intergration
+# NT make file 
+#
+#
+#**********************************************************************/
+
+#--------------------------------
+# Required Environment Variables
+#--------------------------------
+
+!ifndef SWISBSDK
+!error The environment variable SWISBSDK is not defined (it should point to your baseline directory).
+!endif
+
+!ifndef SPIDERMONKEYDIR
+!error The environment variable SPIDERMONKEYDIR is not defined.
+!endif
+
+!ifndef XERCESDIR
+!error The environment variable XERCESDIR is not defined.
+!endif
+
+# By default, set PRODUCT_LIB_PREFIX to SB
+!if "$(PRODUCT_LIB_PREFIX)" == ""
+!message PRODUCT_LIB_PREFIX not defined. Defaulting to SB
+PRODUCT_LIB_PREFIX = SB
+!endif
+
+#--------------------------------
+# Project specific settings
+#--------------------------------
+PROJ_ROOT = ..
+BUILDSUBDIRS =
+PUBLIC_HEADERS = \
+	SBjsi.h
+
+PUBLIC_ERROR_FILES = \
+	SBjsiDiagnostics.xml \
+	SBjsiErrors.xml
+
+# Extra compiler flags to support SpiderMonkey
+SPIDERMONKEY_CFLAGS = \
+	-DHAVE_SPIDERMONKEY \
+	-DVXICHAR_SIZE_16_BITS \
+	-I"$(SPIDERMONKEYDIR)/src" \
+	-I"$(SPIDERMONKEYDIR)" \
+	-DXP_PC \
+	-DXP_WIN \
+	-DJSI_MUST_DECLARE_VARS \
+!ifdef JS_THREADSAFE
+	-DJS_THREADSAFE \
+!endif
+# Following flag triggers garbage collection after every JSI access, use
+# this during Purify runs to make sure we're really solid
+!if defined(PURIFY)
+	-DJSI_MEMORY_TEST
+!endif
+
+PROJ_CFLAGS = \
+  -I"./" \
+  -I"dom" \
+  -I "$(XERCESDIR)/src"  \
+  -I "$(XERCESDIR)/src/xercesc" \
+  -I "$(XERCESDIR)/include" \
+  -I "$(XERCESDIR)/include/xercesc"\
+  -DHAVE_XERCES \
+  -DCOMPANY_DOMAIN=L\"com.vocalocity\" \
+  -DMODULE_PREFIX=L\"swi:\" \
+  $(SPIDERMONKEY_CFLAGS)
+
+MYLFLAGS = \
+!if "$(CFG)" == "debug"
+  -libpath:"$(SPIDERMONKEYDIR)/src/Debug"
+!else  
+  -libpath:"$(SPIDERMONKEYDIR)/src/Release"
+!endif
+
+# Suppress using a *.def file to define exports from DLLs, use the
+# SYMBOL_EXPORT_DECL definition from VXIheaderPrefix.h instead
+NO_DEF_FILES = 1
+
+#--------------------------------
+# Static libraries
+#--------------------------------
+LIBS = 
+
+#--------------------------------
+# Dynamic libraries
+#--------------------------------
+DLLS = $(PRODUCT_LIB_PREFIX)jsi
+
+$(PRODUCT_LIB_PREFIX)jsi_OBJS = \
+        $(BUILDDIR)/SBjsi.obj \
+        $(BUILDDIR)/SBjsiFuncs.obj \
+        $(BUILDDIR)/JsiRuntime.obj \
+        $(BUILDDIR)/JsiContext.obj \
+				$(BUILDDIR)/SBjsiLogger.obj \
+        $(BUILDDIR)/SBjsi.res \
+        $(BUILDDIR)/JSDOMNode.obj \
+        $(BUILDDIR)/JSDOMDocument.obj \
+        $(BUILDDIR)/JSDOMNodeList.obj \
+        $(BUILDDIR)/JSDOMNamedNodeMap.obj \
+        $(BUILDDIR)/JSDOMElement.obj \
+        $(BUILDDIR)/JSDOMCharacterData.obj \
+        $(BUILDDIR)/JSDOMAttr.obj \
+        $(BUILDDIR)/JSDOMText.obj \
+        $(BUILDDIR)/JSDOMComment.obj \
+        $(BUILDDIR)/JSDOMCDATA.obj \
+        $(BUILDDIR)/JSDOMEntityReference.obj \
+        $(BUILDDIR)/JSDOMProcessingInstruction.obj \
+        $(BUILDDIR)/JSDOMException.obj \
+        $(BUILDDIR)/JSDOM.obj
+
+$(PRODUCT_LIB_PREFIX)jsi_LIBS = \
+# SB libraries
+	VXIvalue$(CFG_SUFFIX).lib \
+	$(PRODUCT_LIB_PREFIX)trd$(CFG_SUFFIX).lib \
+# SpiderMonkey libraries
+	js32.lib
+		
+#-------------------------------------
+# Programs
+#-------------------------------------
+PROGS =
+		
+#--------------------------------------------
+# Include the common def's and config logic
+#--------------------------------------------
+!include "..\make\i386-win32\make.defs"
+
+#------------------------------------------------
+# Targets
+#------------------------------------------------
+all : $(LIBS) $(DLLS) $(PROGS)
+
+#---------------------------------------------
+# Include some rules common to all makefiles
+#---------------------------------------------
+
+!include "..\make\i386-win32\make.rules"
+
+#---------------------
+# Inference rules
+#---------------------
+
+{dom}.c{$(BUILDDIR)}.obj:
+        $(CC) $(CFLAGS) -c $<
+
+{dom}.cpp{$(BUILDDIR)}.obj:
+        $(CC) $(CPPFLAGS) -c $<
+

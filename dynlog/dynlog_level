@@ -1,0 +1,167 @@
+#!/usr/bin/perl --        -*- CPerl -*-
+
+##  Copyright 2006,2007 Ampersand Inc., Doug Campbell
+##
+##  This file is part of dynlog.
+##
+##  dynlog is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  dynlog is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with dynlog; if not, see <http://www.gnu.org/licenses/>.
+
+use Cam::Scom;
+use Cam::Scom::Event;
+
+@::Msg_level_strings = (
+			"EMRG",
+			"ALRT",
+			"CRIT",
+			"EROR",
+			"WARN",
+			"NOTI",
+			"INFO",
+			"DBUG"
+			);
+
+%::Msg_level_strings = (
+			"EMRG" => 0,
+			"ALRT" => 1,
+			"CRIT" => 2,
+			"EROR" => 3,
+			"WARN" => 4,
+			"NOTI" => 5,
+			"INFO" => 6,
+			"DBUG" => 7,
+			);
+
+
+use strict;
+
+sub usage
+{
+    die ("usage: dynlog_level [-loghost host] [0-7|EMRG|ALRT|CRIT|EROR|WARN|NOTI|INFO|DBUG]\n");
+};
+
+sub main
+{
+    my ($ok, $msg, $arg, $newlevel, @events, $eventlist, $fh, $got_level);
+    my ($oldlevel, $scom);
+    my ($loghost) = "";
+    my Cam::Scom::Event $event;
+
+    while (defined ($arg = shift (@::ARGV)))
+    {
+	if ($arg =~ /^-loghost/)
+	{
+	    defined ($loghost = shift (@::ARGV)) || usage();
+	}
+	elsif ($arg =~ /^-/)
+	{
+	    usage();
+	}
+	elsif (! defined ($newlevel))
+	{
+	    $newlevel = $arg;
+	}
+	else
+	{
+	    &usage();
+	};
+    };
+
+    if (defined ($newlevel))
+    {
+	if ($newlevel =~ /^\d+$/)
+	{
+	    ($newlevel >= 0)
+	      && ($newlevel <= 7)
+		|| &usage();
+	}
+	elsif (! defined ($newlevel = $::Msg_level_strings{$newlevel}))
+	{
+	    &usage();
+	};
+    };
+
+    defined ($scom = new Cam::Scom)
+      || die ("Cannot get initial Scom object");
+    (($ok, $msg) = $scom->connect ("::LOGSRV", $loghost, 6410, ":", 0))[0]
+      || die ($msg);
+    @events = $scom->getevents (10);
+    $got_level = 0;
+    while (defined ($eventlist = shift (@events)))
+    {
+	$fh = shift (@$eventlist);
+	($fh eq "::LOGSRV")
+	  || die ("Event from unrecognized filehandle \"$fh\"");
+	while (defined ($msg = shift (@$eventlist)))
+	{
+	    if (ref ($msg))
+	    {
+		$event = $msg;
+		die ("LOGSRV connection died with code " . $event->{term});
+	    }
+	    else
+	    {
+		$got_level = 1;
+		$oldlevel = unpack ("C", $msg);
+	    };
+	};
+    };
+
+    $got_level || die ("Got no events from log server");
+
+    if (! defined ($newlevel))
+    {
+	print STDOUT ("Current log level = ",
+		      $oldlevel,
+		      " (",
+		      $::Msg_level_strings[$oldlevel],
+		      ")\n");
+	exit (0);
+    };
+
+    (($ok, $msg) = $scom->write ("::LOGSRV", "$newlevel\n"))[0]
+      || die ($msg);
+
+    @events = $scom->getevents (10);
+    $got_level = 0;
+    while (defined ($eventlist = shift (@events)))
+    {
+	$fh = shift (@$eventlist);
+	($fh eq "::LOGSRV")
+	  || die ("Event from unrecognized filehandle \"$fh\"");
+	while (defined ($msg = shift (@$eventlist)))
+	{
+	    if (ref ($msg))
+	    {
+		$event = $msg;
+		die ("LOGSRV connection died with code " . $event->{term});
+	    }
+	    else
+	    {
+		if (unpack ("C", $msg) == $newlevel)
+		{
+		    $got_level = 1;
+		};
+	    };
+	};
+    };
+
+    $got_level
+      || die ("Did not receive confirmation of new level from log server");
+
+    print STDOUT ("Log level changed to $newlevel (" .
+		  $::Msg_level_strings[$newlevel] .
+		  ") successfully.\n");
+};
+
+&main();

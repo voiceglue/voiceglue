@@ -1,0 +1,11 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		VXIpromptCreateResource;
+		VXIpromptDestroyResource;
+		VXIpromptInit;
+		VXIpromptShutDown;
+	local:
+	  *;
+	};
+}

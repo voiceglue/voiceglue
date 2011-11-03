@@ -1,0 +1,5 @@
+#!/usr/bin/perl --       -*-CPerl-*-
+($text, $file, $lang) = @::ARGV[1..3];
+system ("espeak", "-m", "-w", $file . ".22khz.wav", $text);
+system ("sox", $file . ".22khz.wav", "-r", "8000", $file);
+system ("rm", $file . ".22khz.wav");

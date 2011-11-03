@@ -1,0 +1,29 @@
+#!/usr/bin/perl -- -*-CPerl-*-
+use strict;
+sub main
+{
+    my ($family) = shift (@::ARGV);
+    my ($release) = shift (@::ARGV);
+    my ($major) = shift (@::ARGV);
+    my ($minor) = shift (@::ARGV);
+    my ($arch) = shift (@::ARGV);
+    my ($xulpkg, $xullibdir, $xullibfile, $destination, @components);
+    if (($release eq "ubuntu") && ($major == 9) && ($minor == 10))
+    {
+	return;
+    }
+    else
+    {
+	$xulpkg = "libxul";
+    };
+    chomp ($xullibdir = `pkg-config --variable=libdir $xulpkg`);
+    $xullibfile = join ("/", $xullibdir, "libmozjs.so");
+    @components = split (/\//, $xullibdir);
+    pop (@components);
+    $destination = join ("/", @components) . "/" . "libmozjs.so";
+    if ((-e $xullibfile) && (! -e $destination))
+    {
+	system ("ln", "-s", $xullibfile, $destination);
+    };
+};
+main();

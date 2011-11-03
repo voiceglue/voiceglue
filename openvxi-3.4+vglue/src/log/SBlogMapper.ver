@@ -1,0 +1,10 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		SBlogErrorMapperCreate;
+		SBlogErrorMapperDestroy;
+		SBlogErrorMapperGetErrorInfo;
+	local:
+	  *;
+	};
+}

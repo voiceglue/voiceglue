@@ -1,0 +1,19 @@
+---
+name: Vxglue
+version: 0.01
+author:
+  - 'Doug Campbell <soup@ampersand.com>'
+abstract: Glue to VXML implementation
+license: gpl
+build_requires:
+  Test::More: 0
+generated_by: Module::Build version 0.2805
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2
+provides:
+  Vxglue:
+    file: lib/Vxglue.pm
+    version: 0.01
+resources:
+  license: http://www.opensource.org/licenses/gpl-license.php

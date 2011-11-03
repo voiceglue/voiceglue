@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<vxml version="2.1" xmlns="http://www.w3.org/2001/vxml">
+   <form id="pickles">
+      <property name="inputmodes" value="dtmf" />
+      <field name="pickone">
+         <prompt>
+            Featured dishes:
+            <enumerate />
+         </prompt>
+
+         <option dtmf="1">swordfish</option>
+         <option dtmf="2">roast beef</option>
+         <option dtmf="3">frog legs</option>
+
+         <filled>
+            <prompt>You selected <value expr="pickone" /></prompt>
+         </filled>
+      </field>
+  </form>
+</vxml>

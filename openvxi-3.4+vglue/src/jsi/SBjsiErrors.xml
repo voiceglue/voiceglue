@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+
+<!--
+Vocalocity OpenVXI
+Copyright (C) 2004-2005 by Vocalocity, Inc. All Rights Reserved.
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+ 
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+ 
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered trademarks of Vocalocity, Inc. 
+OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.
+-->
+
+<ErrorMessages moduleName="*SBjsi">
+    <error num="100" severity="1">SBjsi: Failed to initialize jsi interface </error>
+    <error num="101" severity="1">SBjsi: Failed to allocate jsi interface </error>
+    <error num="102" severity="1">SBjsi: NULL interface pointer </error>
+    <error num="103" severity="1">SBjsi: out of memory </error>
+    <error num="200" severity="2">SBjsi: invalid argument </error>
+    <error num="201" severity="2">SBjsi: Attempt to execute function when not initialized </error>
+    <error num="202" severity="2">SBjsi: Application defined exception thrown </error>
+    <error num="300" severity="3">SBjsi: security violation, maximum branches exceeded </error>
+    <error num="301" severity="3">SBjsi: security violation, maximum statements exceeded </error>
+    <error num="400" severity="2">SBjsi: ECMAScript error thrown</error>
+    <error num="401" severity="2">SBjsi: ECMAScript syntax error thrown</error>
+    <error num="402" severity="2">SBjsi: ECMAScript reference error thrown</error>
+    <error num="403" severity="2">SBjsi: ECMAScript range error thrown</error>
+    <error num="404" severity="2">SBjsi: ECMAScript type error thrown</error>
+    <error num="405" severity="2">SBjsi: ECMAScript evaluate error thrown</error>
+    <error num="406" severity="2">SBjsi: ECMAScript URI error thrown</error>
+    <error num="500" severity="2">SBjsi: ECMAScript engine error</error>
+    <error num="501" severity="2">SBjsi: ECMAScript engine exception</error>
+    <error num="502" severity="3">SBjsi: ECMAScript engine warning</error>
+    <error num="503" severity="3">SBjsi: ECMAScript engine strict check warning</error>
+</ErrorMessages>

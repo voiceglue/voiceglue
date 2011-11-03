@@ -1,0 +1,38 @@
+##  Copyright 2006,2007 Ampersand Inc., Doug Campbell
+##
+##  This file is part of dynlog.
+##
+##  dynlog is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  dynlog is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with dynlog; if not, see <http://www.gnu.org/licenses/>.
+
+SHELL = /bin/sh
+RM = rm -f
+INSTALL = install
+
+install:
+	$(INSTALL) dynlog /usr/bin
+	$(INSTALL) dynlog_level /usr/bin
+	$(INSTALL) dynlog.init /etc/init.d/dynlog
+	-/usr/sbin/useradd -r -c "dynlog" -s /sbin/nologin -d /var/log/dynlog dynlog 2> /dev/null
+	/sbin/chkconfig --add dynlog
+
+uninstall:
+	/sbin/service dynlog stop > /dev/null 2>&1
+	/sbin/chkconfig --del dynlog
+	-/usr/sbin/userdel -f dynlog 2> /dev/null
+	$(RM) /usr/bin/dynlog
+	$(RM) /usr/bin/dynlog_level
+	$(RM) /etc/init.d/dynlog
+
+clean:
+	$(RM) *.o *.so

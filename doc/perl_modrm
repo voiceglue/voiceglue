@@ -1,0 +1,68 @@
+#!/usr/bin/perl -w        -*-CPerl-*-
+
+use strict;
+use IO::Dir;
+use ExtUtils::Packlist;
+use ExtUtils::Installed;
+
+use strict;
+
+sub emptydir($)
+{
+    my ($dir) = @_;
+    my $dh = IO::Dir->new($dir) || return(0);
+    my @count = $dh->read();
+    $dh->close();
+    return(@count == 2 ? 1 : 0);
+}
+
+sub main
+{
+    my ($arg_map) = {};
+    my ($rm_count) = 0;
+    map ($arg_map->{$_} = 1, @::ARGV);
+
+    # Find all the installed packages
+    my $installed = ExtUtils::Installed->new();
+
+    if (! scalar (keys (%$arg_map)))
+    {
+	print ("usage: modrm module ...\n");
+	print ("Perl modules available for removal:\n");
+	foreach my $module (grep(!/^Perl$/, $installed->modules()))
+	{
+	    my $version = $installed->version($module) || "???";
+	    print ("\tModule $module version $version\n");
+	};
+	exit (1);
+    };
+
+    foreach my $module (grep(!/^Perl$/, $installed->modules()))
+    {
+	my $version = $installed->version($module) || "???";
+	if (defined ($arg_map->{$module}))
+	{
+	    # Remove all the files
+	    delete $arg_map->{$module};
+	    print("Removing module $module version $version\n");
+	    foreach my $file (sort($installed->files($module)))
+	    {
+		print("\trm $file\n");
+		unlink($file);
+	    }
+	    my $pf = $installed->packlist($module)->packlist_file();
+	    print("\trm $pf\n");
+	    unlink($pf);
+	    foreach my $dir (sort($installed->directory_tree($module)))
+	    {
+		if (emptydir($dir))
+		{
+		    print("\trmdir $dir\n");
+		    rmdir($dir);
+		}
+	    }
+	}
+    }
+};
+
+main();

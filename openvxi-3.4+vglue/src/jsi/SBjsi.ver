@@ -1,0 +1,15 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		OSBjsiCreateResource;
+		OSBjsiDestroyResource;
+		OSBjsiInit;
+		OSBjsiShutDown;
+		SBjsiCreateResource;
+		SBjsiDestroyResource;
+		SBjsiInit;
+		SBjsiShutDown;
+	local:
+	  *;
+	};
+}

@@ -1,0 +1,471 @@
+#!/usr/bin/perl --        -*-CPerl-*-
+
+use Cwd;
+use File::Copy;
+
+use strict;
+
+##  ($family, $release, $major_version, $minor_version, $arch) = get_os();
+##    Returns these values for various OS's:
+##      family	release	major_version	minor_version	arch
+##      ------	-------	-------------	-------------	----
+##      unknown	unknown	0		0		unknown
+##      debian	ubuntu	8		04		i686
+##      debian	ubuntu	8		04		x86_64
+##      debian	ubuntu	8		10		i686
+##      debian	ubuntu	8		10		x86_64
+##      debian	ubuntu	9		04		i686
+##      debian	ubuntu	9		04		x86_64
+##      debian	ubuntu	9		10		i686
+##      debian	ubuntu	9		10		x86_64
+##      debian	ubuntu	10		04		i686
+##      debian	ubuntu	10		04		x86_64
+##      redhat	fedora	9		0		i686
+##      redhat	fedora	9		0		x86_64
+##      redhat	fedora	10		0		i686
+##      redhat	fedora	10		0		x86_64
+##      redhat	fedora	11		0		i686
+##      redhat	fedora	11		0		x86_64
+##      redhat	fedora	12		0		i686
+##      redhat	fedora	12		0		x86_64
+##      redhat  centos  5		X		x86_64
+##      redhat  rhel	5		X		x86_64
+sub get_os
+{
+    my ($family) = "unknown";
+    my ($release) = "unknown";
+    my ($major) = 0;
+    my ($minor) = 0;
+    my ($arch) = "unknown";
+    my ($raw);
+
+    if (-f "/etc/redhat-release")
+    {
+	$family = "redhat";
+	$raw = `cat /etc/redhat-release`;
+	if ($raw =~ /Fedora\s+release\s+(\d+)/)
+	{
+	    $release = "fedora";
+	    $major = $1;
+	    $minor = 0;
+	    chomp ($arch = `uname -m`);
+	}
+	elsif ($raw =~ /CentOS\s+release\s+(\d+)\.(\d+)/)
+	{
+	    $release = "centos";
+	    $major = $1;
+	    $minor = $2;
+	    chomp ($arch = `uname -m`);
+	}
+	elsif ($raw =~ /Red Hat Enterprise Linux\s+.*\s+release\s+(\d+)\.(\d+)/)
+	{
+	    $release = "rhel";
+	    $major = $1;
+	    $minor = $2;
+	    chomp ($arch = `uname -m`);
+	};
+    }
+    elsif (-f "/etc/debian_version")
+    {
+	$family = "debian";
+	$raw = `cat /etc/issue`;
+	if ($raw =~ /Ubuntu\s+(\d+)\.(\d+)/)
+	{
+	    $release = "ubuntu";
+	    $major = $1;
+	    $minor = $2;
+	    chomp ($arch = `uname -m`);
+	}
+	elsif ($raw =~ /Ubuntu\s+lucid/)
+	{
+	    $release = "ubuntu";
+	    $major = 10;
+	    $minor = 4;
+	    chomp ($arch = `uname -m`);
+	};
+    };
+
+    return ($family, $release, $major, $minor, $arch);
+};
+
+##  Dies if any prerequisites are not satisfied
+sub verify_prerequisites
+{
+    my ($prereq_pkg, $spew);
+    my (@prereqs) = ();
+    my (@prereqs_missing) = ();
+
+    print ::STDOUT ("Installing on " . $::Release . " " .
+		    $::Major . "." . $::Minor . "\n");
+    print ::STDOUT ("Checking voiceglue package prerequisites...\n");
+
+    if (($::Release eq "ubuntu") && ($::Major == 8) && ($::Minor == 4))
+    {
+	@prereqs = (
+		    "gcc",
+		    "g++",
+		    "libxerces28-dev",
+		    "libmozjs-dev",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "libssl-dev",
+		    "libxml-libxml-perl",
+		    "libbsd-resource-perl",
+		    "libmodule-build-perl",
+		    "liburi-perl",
+		    "pkg-config",
+		    "libsox-fmt-base"
+		   );
+    }
+    elsif (($::Release eq "ubuntu") &&
+	   ((($::Major == 8) && ($::Minor == 10)) ||
+	    (($::Major == 9) && ($::Minor == 4))))
+    {
+	@prereqs = (
+		    "gcc",
+		    "g++",
+		    "libxerces-c2-dev",
+		    "libmozjs-dev",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "libssl-dev",
+		    "libxml-libxml-perl",
+		    "libbsd-resource-perl",
+		    "libmodule-build-perl",
+		    "liburi-perl",
+		    "pkg-config",
+		    "libsox-fmt-base"
+		   );
+    }
+    elsif (($::Release eq "ubuntu") &&
+	   ($::Major == 9) && ($::Minor == 10))
+    {
+	@prereqs = (
+		    "gcc",
+		    "g++",
+		    "libxerces-c2-dev",
+#		    "libmozjs-dev",
+		    "libmozjs0d",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "libssl-dev",
+		    "libxml-libxml-perl",
+		    "libbsd-resource-perl",
+		    "libmodule-build-perl",
+		    "liburi-perl",
+		    "pkg-config",
+		    "libsox-fmt-base"
+		   );
+    }
+    elsif (($::Release eq "ubuntu") &&
+	   ($::Major >= 10))
+    {
+	@prereqs = (
+		    "gcc",
+		    "g++",
+		    "libxerces-c2-dev",
+		    "xulrunner-dev",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "libssl-dev",
+		    "libxml-libxml-perl",
+		    "libbsd-resource-perl",
+		    "libmodule-build-perl",
+		    "liburi-perl",
+		    "pkg-config",
+		    "libsox-fmt-base"
+		   );
+    }
+    elsif ($::Release eq "fedora")
+    {
+	@prereqs = (
+		    "gcc-c++",
+		    "libstdc++-devel",
+		    "xerces-c-devel",
+		    "xulrunner-devel",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "openssl-devel",
+		    "perl-XML-LibXML",
+		    "perl-BSD-Resource",
+		    "perl-Module-Build",
+		    "perl-Test-Base",
+		    "pkgconfig"
+		   );
+    }
+    elsif (($::Release eq "centos") || ($::Release eq "rhel"))
+    {
+	@prereqs = (
+		    "gcc-c++",
+		    "libstdc++-devel",
+		    "xerces-c-devel",
+		    "xulrunner-devel",
+		    "flite",
+		    "sox",
+		    "curl",
+		    "openssl-devel",
+		    "perl-XML-LibXML",
+		    "perl-BSD-Resource",
+		    "perl-Module-Build",
+		    "perl-URI-Escape-XS",
+		    "perl-Test-Base",
+		    "perl-URI",
+		    "pkgconfig"
+		   );
+    }
+    else
+    {
+	die (join (" ", "No prerequisite list available for ",
+		   $::Family, $::Release, $::Major, $::Minor, $::Arch));
+    };
+
+    foreach $prereq_pkg (@prereqs)
+    {
+	if (! is_package_installed($prereq_pkg))
+	{
+	    push (@prereqs_missing, $prereq_pkg);
+	};
+    };
+
+    if (scalar (@prereqs_missing))
+    {
+	die ("Cannot install voiceglue until the " .
+	     "following prerequisite packages are installed: " .
+	    join (", ", @prereqs_missing));
+    };
+
+    $spew = `asterisk -V`;
+    if ($spew !~ /Asterisk\s+(\d+)\.(\d+)/)
+    {
+	print ::STDOUT ("WARNING: Cannot find asterisk on local machine\n");
+    };
+    scalar (getpwnam("asterisk"))
+      || die ("Required user account \"asterisk\" not found\n");
+
+    print ::STDOUT ("Voiceglue package prerequisites OK\n");
+};
+
+##  $is_it = is_package_installed ($package_name)
+##    Returns true if the package is installed, false o.w.
+sub is_package_installed
+{
+    my ($pkgname) = shift (@_);
+    if ($::Family eq "debian")
+    {
+	system ("dpkg -s $pkgname > /dev/null");
+	if ($? == 0) {return 1;};
+	return 0;
+    }
+    elsif ($::Family eq "redhat")
+    {
+	system ("rpm -q -i $pkgname > /dev/null");
+	if ($? == 0) {return 1;};
+	return 0;
+    };
+};
+
+##  Establish the ever-changing javascript build flags:
+##    JSLIB, JSCFLAGS, JSLIBFLAGS, and JSUSESETOPERATIONCALLBACK
+sub determine_javascript_build_config
+{
+    $::ENV{"JSUSESETOPERATIONCALLBACK"} = "2";
+    if ($::Family eq "redhat")
+    {
+	$::ENV{"JSLIB"} = "js";
+	chomp ($::ENV{"JSCFLAGS"} = `pkg-config --cflags mozilla-js`);
+	chomp ($::ENV{"JSLIBFLAGS"} = `pkg-config --libs mozilla-js`);
+	if (($::Release eq "centos") || ($::Release eq "rhel"))
+	{
+            if (($::Major > 5) ||
+                (($::Major == 5) && ($::Minor >= 5)))
+            {
+                $::ENV{"JSUSESETOPERATIONCALLBACK"} = "2";
+            }
+            else
+            {
+                $::ENV{"JSUSESETOPERATIONCALLBACK"} = "3";
+            };
+	};
+    }
+    elsif ($::Family eq "debian")
+    {
+	$::ENV{"JSLIB"} = "mozjs";
+	if (($::Release eq "ubuntu") &&
+	    (($::Major == 9) && ($::Minor == 10)))
+	{
+	    chomp ($::ENV{"JSCFLAGS"} = `pkg-config --cflags xulrunner-js`);
+	    chomp ($::ENV{"JSLIBFLAGS"} = `pkg-config --libs xulrunner-js`);
+	}
+	elsif (($::Release eq "ubuntu") && ($::Major >= 10))
+	{
+	    chomp ($::ENV{"JSCFLAGS"} = `pkg-config --cflags mozilla-js`);
+	    chomp ($::ENV{"JSLIBFLAGS"} = `pkg-config --libs mozilla-js`);
+	    $::ENV{"JSUSESETOPERATIONCALLBACK"} = "1";
+	}
+	else
+	{
+	    chomp ($::ENV{"JSCFLAGS"} = `pkg-config --cflags libxul`);
+	    chomp ($::ENV{"JSLIBFLAGS"} = `pkg-config --libs libxul`);
+	};
+	$::ENV{"JSCFLAGS"} .= " -DMOZILLA_1_8_BRANCH";
+    };
+
+    defined ($::ENV{"JSLIB"}) && length ($::ENV{"JSLIB"})
+      || die ("Unable to determine JSLIB\n");
+    defined ($::ENV{"JSCFLAGS"}) && length ($::ENV{"JSCFLAGS"})
+      || die ("Unable to determine JSCFLAGS\n");
+    defined ($::ENV{"JSLIBFLAGS"}) && length ($::ENV{"JSLIBFLAGS"})
+      || die ("Unable to determine JSLIBFLAGS\n");
+    defined ($::ENV{"JSUSESETOPERATIONCALLBACK"})
+      && length ($::ENV{"JSUSESETOPERATIONCALLBACK"})
+	|| die ("Unable to determine JSUSESETOPERATIONCALLBACK\n");
+}
+
+##  install_executable (directory, executable_name)
+sub install_executable
+{
+    my ($executable_dir) = shift (@_);
+    my ($executable_name) = shift (@_);
+    my ($start_dir) = getcwd;
+
+    chdir ($executable_dir)
+      || die ("Cannot chdir to \"$executable_dir\" to install " .
+	      "executable \"$executable_name\": $!");
+    copy ($executable_name, "/usr/bin")
+      || die ("Failed copying \"$executable_name\" to /usr/bin: $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after installing " .
+	      "executable \"$executable_name\": $!");
+};
+
+##  install_perl_module (directory, module_name)
+sub install_perl_module
+{
+    my ($module_dir) = shift (@_);
+    my ($module_name) = shift (@_);
+    my ($start_dir) = getcwd;
+
+    chdir ($module_dir)
+      || die ("Cannot chdir to \"$module_dir\" to install perl module " .
+	      "\"$module_name\": $!");
+    system ("perl", "Build.PL")
+      && die ("Failed running \"perl Build.PL\" in \"$module_dir\"" .
+	      " to install perl module \"$module_name\": $!");
+    system ("./Build")
+      && die ("Failed running \"./Build\" in \"$module_dir\"" .
+	      " to install perl module \"$module_name\": $!");
+    system ("./Build", "test")
+      && die ("Failed running \"./Build\" in \"$module_dir\"" .
+	      " to install perl module \"$module_name\": $!");
+    system ("./Build", "install", "uninst=1")
+      && die ("Failed running \"./Build\" in \"$module_dir\"" .
+	      " to install perl module \"$module_name\": $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after installing perl module " .
+	      "\"$module_name\": $!");
+};
+
+sub install_openvxi
+{
+    my ($start_dir) = getcwd;
+    my ($openvxi_dir) = "openvxi-3.4+vglue";
+
+    ##  Remove old soundcache directories
+    system ("rm", "-r", "-f", "/usr/share/asterisk/sounds/voiceglue");
+    system ("rm", "-r", "-f", "/var/lib/asterisk/sounds/voiceglue");
+
+    chdir ($openvxi_dir)
+      || die ("Cannot chdir to \"$openvxi_dir\" to install openvxi: $!" );
+    system ("./build_openvxi $::Family, $::Release, $::Major, $::Minor, $::Arch")
+      && die ("Failed running \"./build_openvxi\" in \"$openvxi_dir\"" .
+	      " to install openvxi: $!");
+    system ("./uninstall_openvxi");
+    system ("./install_openvxi")
+      && die ("Failed running \"./install_openvxi\" in \"$openvxi_dir\"" .
+	      " to install openvxi: $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after installing openvxi: $! ");
+};
+
+sub install_with_make
+{
+    my ($pkg_dir) = shift (@_);
+    my ($start_dir) = getcwd;
+    my ($makefile) = "Makefile." . $::Family;
+    chdir ($pkg_dir)
+      || die ("Cannot chdir to \"$pkg_dir\" for install: $!" );
+    if (! -f $makefile)
+    {
+	$makefile = "Makefile";
+    };
+    system ("make", "-f", $makefile, "install")
+      && die ("Failed running \"make install\" in \"$pkg_dir\": $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after installing $pkg_dir: $!");
+};
+
+sub install_headers
+{
+    my ($lib_dir) = shift (@_);
+    my ($start_dir) = getcwd;
+    chdir ($lib_dir)
+      || die ("Cannot chdir to \"$lib_dir\" to install headers: $!" );
+    system ("make", "install-headers")
+      && die ("Failed running \"make install-headers\" in \"$lib_dir\"" .
+	      " to install headers: $!");
+    chdir ($start_dir)
+      || die ("Cannot chdir to \"$start_dir\" after installing headers: $! ");
+};
+
+sub main
+{
+    ##  Determine distribution
+    ($::Family, $::Release, $::Major, $::Minor, $::Arch) = get_os();
+
+    if (($::Family eq "unknown") ||
+	($::Release eq "unknown") ||
+	($::Arch eq "unknown") ||
+	($::Major == 0))
+    {
+	die ("Unknown OS");
+    };
+
+    ##  Verify prerequisites
+    verify_prerequisites();
+
+    ##  Establish javascript build config
+    determine_javascript_build_config();
+
+    ##  Create LD_LIBRARY_PATH for Vxglue tests
+    chomp ($::ENV{"LD_LIBRARY_PATH"} =
+	   "/usr/lib/xulrunner-" . `xulrunner --gre-version 2>/dev/null`);
+    (-d $::ENV{"LD_LIBRARY_PATH"}) || delete $::ENV{"LD_LIBRARY_PATH"};
+
+    ##  Shut down previous versions, if any
+    print ::STDOUT ("Shutting down previous versions, if any\n");
+    (-f "/etc/init.d/voiceglue") && system ("/etc/init.d/voiceglue stop");
+    (-f "/etc/init.d/phoneglue") && system ("/etc/init.d/phoneglue stop");
+    (-f "/etc/init.d/dynlog") && system ("/etc/init.d/dynlog stop");
+    (-f "/etc/init.d/asterisk") && system ("/etc/init.d/asterisk stop");
+
+    ##  Do the voiceglue install
+    print ::STDOUT ("Installing voiceglue components\n");
+    install_perl_module ("Cam-Scom", "Cam::Scom");
+    install_with_make ("dynlog");
+    install_perl_module ("Satc", "Satc");
+    install_perl_module ("Voiceglue-Conf", "Voiceglue::Conf");
+    install_with_make ("phoneglue", "phoneglue");
+    install_perl_module ("SRGSDTMF", "SRGSDTMF");
+    install_headers ("libvglue");
+    install_openvxi();
+    install_with_make ("libvglue");
+    install_perl_module ("Vxglue", "Vxglue");
+    install_with_make ("voiceglue", "voiceglue");
+};
+
+main();

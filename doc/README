@@ -1,0 +1,62 @@
+This is the README for voiceglue version 0.12.2
+
+Voiceglue is software that interprets VXML files using
+the OpenVXI VXML interpreter and Asterisk telephony.
+
+All documentation including installation and configuration
+guides have been moved to http://voiceglue.org/wiki
+
+
+Changes
+-------
+0.12.2 Support for %%hangup in initial URL and end-of-call callback
+
+0.12.1 Support for %%ani %%dnis and %%callid in initial URL
+
+0.12 Support for Ubuntu Karmic and Lucid
+     Support for RHEL and CentOS
+     Increase SpiderMonkey memory allocations
+     Added session.connection.local.uri and ...remote.uri
+     Fixed race condition bugs
+     Fixed memory leaks
+     Removed delay-inducing OpenVXI caching
+     Added ssml_passthrough option in voiceglue.conf
+     Added passing variables to and from Asterisk
+
+0.11 Fix file handle management bug
+     Re-add gsm audio support
+     Fix bargein handling
+
+0.10 Improved audio caching
+     Cookie passing on audio fetching
+     Handles maxage and audiomaxage of 0 properly
+     Uses HTTP Content-Type for audio content when available
+     Defaults to not requiring access-control directive in returned <data>
+     New transfer method, new config file param “blind_xfer_method”
+     Auto-install support for Ubuntu 9.04 (Jaunty)
+
+0.9  Auto-install support for Ubuntu 8.04 & 8.10 and Fedora 9 and 10,
+     Parameter-passsing from Asterisk dialplan,
+     Easy alternate TTS support,
+     Fixed VXML 2.1 <data> tag DOM functions in Ubuntu,
+     Fixed mangling of certain characters in TTS and grammars,
+     Fixed recording hangups sometimes not being handled properly,
+     Fixed improper grammar type detection,
+     and many other bug fixes.
+
+0.8  Fix for bug in install-voiceglue, fixes to uninstall-voiceglue
+
+0.7  Support for debian systems like Ubuntu, and perl > 5.8
+
+0.6  Fixed <option> tag
+
+0.5  Turned off Xerces XML validation, as it was broken
+
+0.4  Fixed bug with cached grammars sometimes returning inactive IDs
+
+0.3  Fixed not finding plain-text TTS with newer versions of LibXML
+
+0.2  Fixed bug with caching of grammars
+     Removed install failures from creation of already-existing acccounts
+
+0.1  Initial release

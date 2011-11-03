@@ -1,0 +1,111 @@
+#!/usr/bin/perl --        -*-CPerl-*-
+
+##  Copyright 2009,2010 Ampersand Inc., Doug Campbell
+##
+##  This file is part of voiceglue.
+##
+##  voiceglue is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  voiceglue is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with voiceglue; if not, see <http://www.gnu.org/licenses/>.
+
+##  voiceglue_init_config: do one-time initialization for voiceglue
+
+use strict;
+
+sub main
+{
+    my ($ast_sound_dir, $matched, $line, @lines, @conf_lines);
+
+    ##  Remove old soundcache directories
+    system ("rm", "-r", "-f", "/usr/share/asterisk/sounds/voiceglue");
+    system ("rm", "-r", "-f", "/var/lib/asterisk/sounds/voiceglue");
+
+    ##  Determine settings for /etc/voiceglue.conf
+
+    ##  Make best guess as to the location of the asterisk sound directory
+    ##  First, try to read it out of /etc/asterisk/asterisk.conf
+    if (open (::FH, "/etc/asterisk/asterisk.conf") &&
+	scalar (@conf_lines = <::FH>) &&
+	close (::FH) &&
+	($conf_lines[0] !~ /\[directories\]\(!\)/))
+    {
+	@lines = grep (/^astvarlibdir\s*=>\s*\S+/, @conf_lines);
+	if (scalar (@lines) == 1)
+	{
+	    $lines[0] =~ /^astvarlibdir\s*=>\s*(\S+)/;
+	    $matched = $1 . "/sounds";
+	    if (-d $matched)
+	    {
+		$ast_sound_dir = $matched;
+	    };
+	};
+    };
+    ##  If that doesn't work, try standard locations
+    if (! defined ($ast_sound_dir))
+    {
+	if ((-d "/var/lib/asterisk/sounds") &&
+	    (! -d "/usr/share/asterisk/sounds"))
+	{
+	    $ast_sound_dir = "/var/lib/asterisk/sounds";
+	}
+	elsif ((! -d "/var/lib/asterisk/sounds") &&
+	       (-d "/usr/share/asterisk/sounds"))
+	{
+	    $ast_sound_dir = "/usr/share/asterisk/sounds";
+	}
+	elsif (-d "/usr/share/asterisk/sounds")
+	{
+	    $ast_sound_dir = "/usr/share/asterisk/sounds";
+	}
+	else
+	{
+	    die ("Cannot determine asterisk sounds directory");
+	};
+    };
+
+    ##  Make updates to /etc/voiceglue.conf
+    if (open (::FH, "/etc/voiceglue.conf")
+	&& scalar (@lines = <::FH>)
+	&& close (::FH))
+    {
+	##  Have to merge in the settings
+	if ($lines[$#lines] !~ /\n$/)
+	{
+	    $lines[$#lines] .= "\n";
+	};
+	$matched = 0;
+	foreach $line (@lines)
+	{
+	    if ($line =~ /^\s*ast_sound_dir\s+=\s+/)
+	    {
+		$line = "ast_sound_dir = $ast_sound_dir\n";
+		$matched = 1;
+	    };
+	};
+	if (! $matched)
+	{
+	    push (@lines, "ast_sound_dir = $ast_sound_dir\n");
+	};
+    }
+    else
+    {
+	##  Make new file
+	@lines = ("ast_sound_dir = $ast_sound_dir\n");
+    };
+
+    open (::FH, ">/etc/voiceglue.conf")
+      && (print ::FH (@lines))
+	&& close (::FH)
+	  || die ("Cannot write /etc/voiceglue.conf: $!");
+};
+
+main();

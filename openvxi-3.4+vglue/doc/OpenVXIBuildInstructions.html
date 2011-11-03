@@ -1,0 +1,210 @@
+<!doctype html public "-//w3c//dtd html 4.0 transitional//en">
+<html>
+	<HEAD>
+		<title>Vocalocity OpenVXI 3.4 Build Instructions</title>
+		<link rel="stylesheet" href="site.css" type="text/css">
+			<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+			<style></style>
+	</HEAD>
+	<body bgcolor="#ffffff" lang="EN-US" link="blue" vlink="blue" class="Normal">
+		<div class="Section1">
+			<h3><img src="images/SPEECH_LOGO.gif"></h3>
+			<h1>Vocalocity OpenVXI 3.4 Build Instructions</h1>
+			<p><br>
+				This document provides instructions for building Vocalocity OpenVXI 3.4 for 
+				several common operating systems.</p>
+			<h2>1. Third Party Software</h2>
+			<p>All third party software must be downloaded the compiled prior to building 
+				OpenVXI 3.4. Build instructions are provided in the third party software 
+				distribution package. The OpenVXI team has only tested/built with the versions 
+				listed below, we highly recommend that you use these versions. The OpenVXI 
+				source code may need to be modified to work with different versions, problems 
+				with different versions may include build errors or robustness issues.&nbsp;
+			</p>
+			<h2>2. Linux</h2>
+			<h2>2.1 Requirements</h2>
+		</div>
+		<ul>
+			<li>
+			gcc version 3.2.2 or later
+			<li>
+				<a href="http://xml.apache.org/xerces-c/index.html">Xerces Version 2.6.0</a>
+			<li>
+				<a href="http://www.mozilla.org/js/spidermonkey/">SpiderMonkey 1.5rc6a</a>
+			<li>
+				Perl 5.6 or later</li>
+		</ul>
+		<h2>2.2 Environment Variables</h2>
+		<p>The following environment variables must be set prior of building OpenVXI 3.4 
+			sources.</p>
+		<ul>
+			<li>
+				<font face="Courier New, Courier, mono">SWISBSDK</font> points to the baseline 
+				of OpenVXI 3.4 for the build environment The baseline structure must be created 
+				as following:
+				<ul>
+					<ul>
+						<li>
+							<div class="Section1"><font face="Courier New, Courier, mono">$(SWISBSDK)/bin</font></div>
+						<li>
+							<div class="Section1"><font face="Courier New, Courier, mono">$(SWISBSDK)/lib</font></div>
+						<li>
+							<div class="Section1"><font face="Courier New, Courier, mono">$(SWISBSDK)/include</font></div>
+						<li>
+							<div class="Section1"><font face="Courier New, Courier, mono">$(SWISBSDK)/config<br>
+								</font>
+							</div>
+						</li>
+					</ul>
+				</ul>
+			<li>
+				<font face="Courier New, Courier, mono">XERCESDIR</font>
+			points to the root directory of compiled Xerces 2.6.0
+			<li>
+				<font face="Courier New, Courier, mono">SPIDERMONKEYDIR</font> points to the 
+				root directory of compiled SpiderMonkey 1.5rc6a</li>
+		</ul>
+		<h2>2.3 Build and Build Order</h2>
+		<h2>Build and Build order:</h2>
+		<p>
+			To build OpenVXI 3.4 sources, cd to each component in the order outlined below, 
+			and carry out the following commands: gmake all-shared to build, gmake clean to 
+			clean. After a successful build, all relevant files will be appropriately 
+			copied to the baseline. By default debug libraries are built; specify <font face="Courier New, Courier, mono">
+				CFG=release</font> or <font face="Courier New, Courier, mono">CFG=debug</font>
+			on the gmake command line to explicitly choose which build type to produce.</p>
+		<p>
+			To ensure a successful build, the following order must be followed:</p>
+		<ul>
+			<li>
+			VXIinterfaces
+			<li>
+			swichar
+			<li>
+			value
+			<li>
+			trd
+			<li>
+			log
+			<li>
+			cache
+			<li>
+			inet
+			<li>
+			jsi
+			<li>
+			VXI
+			<li>
+				VXIclient</li>
+		</ul>
+		<p></p>
+		<h2>3. Win32</h2>
+		<div class="Section1">
+			<h2>3.1 Requirements</h2>
+		</div>
+		<UL>
+			<li>
+			MSVC++ 6.0 or later - OpenVXI has been tested with Visual Studio .NET and does 
+			not&nbsp;require STLPort.&nbsp; However, it should still be possible to use it 
+			(the makefiles will have to be modified to account for a different lib name).
+			<li>
+				<a href="http://xml.apache.org/xerces-c/index.html">Xerces Version 2.6.0</a>
+			<li>
+				<a href="http://www.mozilla.org/js/spidermonkey/">SpiderMonkey 1.5rc6a</a>
+			<li>
+				<a href="http://www.openssl.org/">OpenSSL 0.9.7e</a>
+			<li>
+			Perl 5.6 or later
+			<li>
+				<a href="http://www.stlport.org/">STLPort</a> 4.6 or later (4.6.1 is not 
+				recommended since we have heard reports of runtime problems with OpenVXI and 
+				4.6.1). As of this version of OpenVXI, the 5.0 RC version of STLPort has not 
+				been tested, and in fact creates a different lib name.&nbsp; Alternatively any 
+				third party STL library (MSVC 6's STL has known robustness and threading 
+				problems, we do not recommend using that STL library). The makefile.rules will 
+				need to be modified for other 3rd party STL libraries.</li></UL>
+		<P><STRONG><FONT color="#ff3300">NOTE</FONT></STRONG>:</B>&nbsp; According to 
+			Mozilla, MSVC (including .NET) users must add /OPT:NOICF&nbsp;flag to the 
+			linker options when building SpiderMonkey.&nbsp; For further information, 
+			reference <A href="http://www.mozilla.org/js/spidermonkey/release-notes/NOICF.html">
+				http://www.mozilla.org/js/spidermonkey/release-notes/NOICF.html</A>.</P>
+		<h2></h2>
+		<h2>3.2 Environment Variables</h2>
+		<p>The following environment variables must be set prior of building OpenVXI 3.4 
+			sources.</p>
+		<ul>
+			<li>
+				<font face="Courier New, Courier, mono">SWISBSDK</font>
+			points to the root directory&nbsp;of the OpenVXI 3.4 distribution.
+			<LI>
+				<font face="Courier New, Courier, mono">XERCESDIR</font>
+			points to the root directory of the compiled Xerces 2.6.0
+			<li>
+				<font face="Courier New, Courier, mono">SPIDERMONKEYDIR</font>
+			points to the root directory of compiled SpiderMonkey 1.5rc6a
+			<li>
+				<font face="Courier New, Courier, mono">OPENSSLDIR</font>
+			points to the root directory of compiled OpenSSL 0.9.7e
+			<li>
+				<font face="Courier New, Courier, mono">STLPORTDIR</font>
+			points to the root directory of the compiled STLPORT library. Not defining this 
+			directory will default to using Microsoft's STL.
+			<LI>
+				<font face="Courier New, Courier, mono">MSVC_VERSION</font> indicates the 
+				version of the MSVC compiler (VC6, VC7 or VC71).&nbsp; The default is VC71.</LI>
+		</ul>
+		<h2></h2>
+		<h2>3.3 Build and Build Order</h2>
+		<p>
+			To build OpenVXI 3.4 sources, navigate to each component directory in order 
+			outlined below and run "<font face="Courier New, Courier, mono">nmake -f 
+				Makefile.NT CFG=release</font>" for release mode or CFG=debug for debug 
+			builds. After a successful build, allrelevant executable files will be 
+			appropriately copied to the $(SWISBSDK)\bin directory, and lib files to the 
+			$(SWISBSDK)lib directory.</p>
+		<p>
+			To ensure a successful build, the following order must be followed:
+		</p>
+		<ul>
+			<li>
+			VXIinterfaces
+			<li>
+			swichar
+			<li>
+			value
+			<li>
+			trd
+			<li>
+			log
+			<li>
+			cache
+			<li>
+			inet
+			<li>
+			jsi
+			<li>
+			VXI
+			<li>
+				VXIclient</li>
+		</ul>
+		<h2>4. Other Operating Systems</h2>
+		<p>OpenVXI does not explicitly support or test with other OS's at this time. If an 
+			integrator would like to support another OS we would recommend starting with 
+			the Linux build instructions and Makefiles as a base. From time to time we have 
+			incorporated changes integrators have done to support other OS's when 
+			practical. Please post any OS related changes to the Open VXI mailing list 
+			(mailto:openvxi-discuss@lists.sourceforge.net) for consideration in future 
+			versions of OpenVXI.
+		</p>
+		<p>
+		</p>
+		<div align="center" style='TEXT-ALIGN:center'>
+			<hr size="2" width="100%" align="center">
+		</div>
+		<p>Copyright (c) 2004-2005 Vocalocity, Inc. All rights reserved.</p>
+		<p>Vocalocity, the Vocalocity logo, and VocalOS are trademarks or registered 
+			trademarks of Vocalocity, Inc.
+			<br>
+			OpenVXI is a trademark of Scansoft, Inc. and used under license by Vocalocity.</p>
+	</body>
+</html>

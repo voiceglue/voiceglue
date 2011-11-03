@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>  <!-- -*-SGML-*- -->
+<vxml version = "2.0" xmlns="http://www.w3.org/2001/vxml">
+
+<form id="top">
+  <property name="inputmodes" value="dtmf"/>
+  <property name="interdigittimeout" value="2s"/>
+  <property name="timeout" value="4s"/>
+  <field name="w" type="digits?maxlength=10">
+    <prompt bargein="true">
+      Please enter a sequence of up to ten digits,
+      terminated by silence or the pound key.
+    </prompt>
+    <noinput>
+        <prompt>I did not hear anything.  Please try again.</prompt>
+        <reprompt/>
+    </noinput>
+    <nomatch>
+      <prompt>I did not get numeric digits.  Please try again.</prompt>
+      <reprompt/>
+    </nomatch>
+  </field>
+  <filled namelist="w">
+    <prompt><value expr="'I got ' + w"/></prompt>
+    <goto next="#top"/>
+  </filled>
+</form>
+
+</vxml>

@@ -1,0 +1,15 @@
+Build.PL
+Changes
+MANIFEST
+META.yml # Will be created by "make dist"
+README
+COPYING
+lib/Cam/Scom.pm
+lib/Cam/Scom.xs
+lib/Cam/Scom/Event.pm
+lib/Cam/Scom/Fh.pm
+t/00-load.t
+t/boilerplate.t
+t/pod-coverage.t
+t/pod.t
+t/scom.t

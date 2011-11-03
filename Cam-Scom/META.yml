@@ -1,0 +1,26 @@
+---
+name: Cam-Scom
+version: 0.07
+author:
+  - 'Doug Campbell <doug.campbell@pobox.com>'
+abstract: Supercharged asynchronous inter-process COMmunication
+license: gpl
+resources:
+  license: http://opensource.org/licenses/gpl-license.php
+build_requires:
+  BSD::Resource: 0
+  Test::More: 0
+provides:
+  Cam::Scom:
+    file: lib/Cam/Scom.pm
+    version: 0.07
+  Cam::Scom::Event:
+    file: lib/Cam/Scom/Event.pm
+    version: 0.01
+  Cam::Scom::Fh:
+    file: lib/Cam/Scom/Fh.pm
+    version: 0.01
+generated_by: Module::Build version 0.3
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2

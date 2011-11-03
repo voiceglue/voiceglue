@@ -1,0 +1,7 @@
+VERSION {
+	OSB_3.0 {
+	global:
+	local:
+	  *;
+	};
+}

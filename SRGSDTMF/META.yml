@@ -1,0 +1,20 @@
+---
+name: SRGSDTMF
+version: 0.01
+author:
+  - 'Doug Campbell <d.campbell@ampersand.com>'
+abstract: An SRGS DTMF partial parser
+license: gpl
+build_requires:
+  Test::More: 0
+  XML::LibXML: 0
+generated_by: Module::Build version 0.2805
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2
+provides:
+  SRGSDTMF:
+    file: lib/SRGSDTMF.pm
+    version: 0.01
+resources:
+  license: http://www.opensource.org/licenses/gpl-license.php

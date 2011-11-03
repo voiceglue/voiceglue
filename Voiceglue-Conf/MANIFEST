@@ -1,0 +1,13 @@
+Build.PL
+Changes
+MANIFEST
+README
+COPYING
+lib/Voiceglue/Conf.pm
+t/00-load.t
+t/boilerplate.t
+t/pod-coverage.t
+t/pod.t
+t/voiceglue-conf.t
+Makefile.PL
+META.yml

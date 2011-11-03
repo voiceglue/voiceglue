@@ -1,0 +1,54 @@
+; PRODUCT_DOC
+;
+; Copyright 2004-2005 Vocalocity
+; All Rights Reserved.
+;
+; SWIchar.dll
+;
+; Module definition file
+;
+; History:
+;
+;
+;
+
+EXPORTS
+; The following are from SWIstring.c
+  SWIatof
+  SWIatofloat
+  SWIwcstof
+  SWIwtof
+  SWIstrtowcs
+  SWIwcstostr
+  SWIitowcs
+  SWIdtowcs
+  SWIdtostr
+  SWIwcstod
+  SWIwcstoi
+  SWIwtoi
+  SWIwcsstrcmp
+
+  SWIisascii
+  SWIisvalid_unicode
+  SWIislatin1
+
+; The following are from SWIutfconversions.c
+  SWIutf8towcslen
+  SWIutf8towcs
+  SWIwcstoutf8
+  SWIwcstoutf8len
+
+; The following are from SWIprintf.cpp
+  SWIvsprintf
+  SWIvswprintf
+  SWIfgetws
+  SWIfprintf
+  SWIfwprintf
+  SWIsprintf
+  SWIswprintf
+  SWIwcstok
+  SWIstrtok
+
+; The following are from genchar.c
+  SWIcharReturnCodeToWcs
+

@@ -1,0 +1,23 @@
+# Platform defaults:
+
+schema/defaults.xml                    VXML_DEFAULTS
+schema/defaults.dtd                    VALIDATOR_DEFAULTS_DTD
+schema/dummy_defaults.xml              DUMMY_VXML_DEFAULTS_DOC
+
+# VoiceXML 2.0 schema
+
+schema/vxml.xsd                        VALIDATOR_VXML
+schema/vxml-datatypes.xsd              VALIDATOR_VXML_DATA
+schema/vxml-attribs.xsd                VALIDATOR_VXML_ATTR
+schema/vxml-grammar-extension.xsd      VALIDATOR_SRGF_EXTN
+schema/vxml-grammar-restriction.xsd    VALIDATOR_SRGF_RSTR
+schema/grammar-core.xsd                VALIDATOR_SRGF_CORE
+schema/vxml-synthesis-extension.xsd    VALIDATOR_SSML_EXTN
+schema/vxml-synthesis-restriction.xsd  VALIDATOR_SSML_RSTR
+schema/synthesis-core.xsd              VALIDATOR_SSML_CORE
+schema/xml.xsd                         VALIDATOR_XML
+schema/XMLSchema.dtd                   VALIDATOR_SCHEMA_DTD
+schema/datatypes.dtd                   VALIDATOR_DATATYPE_DTD
+schema/vxml.dtd                        VALIDATOR_VXML_DTD
+
+# Due to a bug in the perl script, keep a blank line after the final entry.

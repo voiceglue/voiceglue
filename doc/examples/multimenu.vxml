@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>  <!-- -*-SGML-*- -->
+<vxml version = "2.0" xmlns="http://www.w3.org/2001/vxml">
+
+<menu id="top" dtmf="true">
+ <property name="inputmodes" value="dtmf"/>
+ <prompt>
+   <enumerate>
+      For <value expr="_prompt"/>, press <value expr="_dtmf"/>.
+   </enumerate>
+ </prompt>
+ <choice next="#news">
+   News
+ </choice>
+ <choice next="#sports">
+   Sports
+ </choice>
+ <choice next="#weather">
+   Weather
+ </choice>
+</menu>
+
+<form id="news">
+ <block>
+   <prompt>You chose news.</prompt>
+   <goto next="#top2"/>
+ </block>
+</form>
+<form id="sports">
+ <block>
+   <prompt>You chose sports.</prompt>
+   <goto next="#top2"/>
+ </block>
+</form>
+<form id="weather">
+ <block>
+   <prompt>You chose weather.</prompt>
+   <goto next="#top2"/>
+ </block>
+</form>
+
+<menu id="top2" dtmf="true">
+ <property name="inputmodes" value="dtmf"/>
+ <prompt>
+   <enumerate>
+      For <value expr="_prompt"/>, press <value expr="_dtmf"/>.
+   </enumerate>
+ </prompt>
+ <choice next="#happy">
+   Happy
+ </choice>
+ <choice next="#sad">
+   Sad
+ </choice>
+ <choice next="#angry">
+   Angry
+ </choice>
+</menu>
+
+<form id="happy">
+ <block>
+   <prompt>You chose happy</prompt>
+   <goto next="#top"/>
+ </block>
+</form>
+<form id="sad">
+ <block>
+   <prompt>You chose sad.</prompt>
+   <goto next="#top"/>
+ </block>
+</form>
+<form id="angry">
+ <block>
+   <prompt>You chose angry.</prompt>
+   <goto next="#top"/>
+ </block>
+</form>
+
+</vxml>

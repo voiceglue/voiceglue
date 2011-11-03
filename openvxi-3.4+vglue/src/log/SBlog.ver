@@ -1,0 +1,12 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		SBlogCreateResource;
+		SBlogDestroyResource;
+		SBlogInit;
+		SBlogShutDown;
+		SBlogVswprintf;
+	local:
+	  *;
+	};
+}

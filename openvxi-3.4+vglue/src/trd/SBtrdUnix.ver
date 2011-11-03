@@ -1,0 +1,24 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		VXItrdInit;
+		VXItrdMutexCreate;
+		VXItrdMutexDestroy;
+		VXItrdMutexLock;
+		VXItrdMutexUnlock;
+		VXItrdShutDown;
+		VXItrdThreadCreate;
+		VXItrdThreadDestroyHandle;
+		VXItrdThreadExit;
+		VXItrdThreadGetID;
+		VXItrdThreadGetIDFromHandle;
+		VXItrdThreadJoin;
+		VXItrdThreadYield;
+		VXItrdTimerCreate;
+		VXItrdTimerDestroy;
+		VXItrdTimerSleep;
+		VXItrdTimerWake;
+	local:
+	  *;
+	};
+}

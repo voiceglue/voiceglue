@@ -1,0 +1,12 @@
+Build.PL
+Changes
+MANIFEST
+META.yml # Will be created by "make dist"
+README
+COPYING
+lib/SRGSDTMF.pm
+t/00-load.t
+t/boilerplate.t
+t/pod-coverage.t
+t/pod.t
+t/srgsdtmf.t

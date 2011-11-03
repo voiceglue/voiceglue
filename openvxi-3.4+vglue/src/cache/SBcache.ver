@@ -1,0 +1,15 @@
+VERSION {
+	OSB_3.0 {
+	global:
+		OSBcacheCreateResource;
+		OSBcacheDestroyResource;
+		OSBcacheInit;
+		OSBcacheShutDown;
+		SBcacheCreateResource;
+		SBcacheDestroyResource;
+		SBcacheInit;
+		SBcacheShutDown;
+	local:
+	  *;
+	};
+}

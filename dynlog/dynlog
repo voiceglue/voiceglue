@@ -1,0 +1,556 @@
+#!/usr/bin/perl --         -*- CPerl -*-
+
+##  Copyright 2006-2008 Ampersand Inc., Doug Campbell
+##
+##  This file is part of dynlog.
+##
+##  dynlog is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  dynlog is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with dynlog; if not, see <http://www.gnu.org/licenses/>.
+
+use Carp;
+use POSIX qw(setsid);
+use Time::HiRes qw(gettimeofday);
+use Cam::Scom;
+use Cam::Scom::Event;
+
+use strict;
+
+$::Max_log_file_size = 20000000;
+$::Number_of_previous_kept = 9;
+$::Log_port = 6410;
+
+##  The dynlog file format is:
+##
+##  hh:mm:ss.mss LEVL MODULE XXAPYYYY <....message....>
+##  -gen'd_here- parm ----prefix----- ------body-------
+##
+##  where LEVL = message severity level
+##        MODULE = software module
+##        XX = CM ID
+##        AP = Application ID
+##        YY = Thread #
+
+##  The message format is:
+##
+##      <level><prefix>\t<body>\n
+##
+##        <level>  =  ASCII log level, e.g. "3"
+##        <prefix> =  What should appear in the prefix for each log line
+##        <body>   =  The log lines, with newlines appearing as \x01 bytes
+
+$::Last_day = (localtime)[7];
+
+##  Maps client fh's to:
+##    ->{"initial"}        -- have got initial msg or not (true = have)
+##    ->{"type"}           -- "log" for log/status clients
+$::Clients = {};
+
+##  fail ($msg)
+##    -- This die handler outputs message before exit
+sub fail
+{
+    my ($msg) = shift (@_);
+
+    eval
+    {
+	print ::LOGFH (Carp::longmess ($msg));
+    };
+
+    confess ($msg);
+};
+
+##  openlog()
+##    Opens a new log file, setting ::LOGFH to its handle.
+##    The file name is taken from $::Logfile.
+##    Rotates existing log files that may already be there.
+sub openlog
+{
+    my ($initial) = shift (@_);
+    my ($i, $from, $to, @params);
+
+    ##  See if the current file is OK (if initial)
+    if ($initial &&
+	scalar (@params = stat ($::Logfile)) &&
+	defined ($params[7]) &&
+	($params[7] < ($::Max_log_file_size - 1024)))
+    {
+	##  Current one is OK
+	open (::LOGFH, ">>$::Logfile")
+	  || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	$::Current_log_file_size = $params[7];
+	select ((select (::LOGFH), $| = 1)[0]);
+    }
+    else
+    {
+	##  Rotate
+	for ($i = $::Number_of_previous_kept - 1; $i >= 0; --$i)
+	{
+	    $from = join (".", $::Logfile, $i);
+	    $to = join (".", $::Logfile, $i+1);
+	    (-e $from) && rename ($from, $to);
+	};
+	(-e $::Logfile) && rename ($::Logfile, join (".", $::Logfile, "0"));
+
+	##  Open new
+	open (::LOGFH, ">$::Logfile")
+	  || warn ("Cannot open \"$::Logfile\" for writing: $!");
+	$::Current_log_file_size = 0;
+	select ((select (::LOGFH), $| = 1)[0]);
+    };
+};
+
+##  The size of the current file
+$::Current_log_file_size = 0;
+
+##  logit ($msg_level, $msg)
+##    Logs to the log file the with level $msg_level
+##    message $msg (which must be newline terminated).
+sub logit
+{
+    my ($msg_level) = shift (@_);
+    my ($msg) = shift (@_);
+    my ($out, $sec, $usec, $tstruct, $tzstruct, $timestamp, @dateinfo);
+
+    ($msg_level <= $::Loglevel) || return;
+
+    ##  Check for need to rotate
+    if ($::Current_log_file_size >= $::Max_log_file_size)
+    {
+	(print ::LOGFH ("============ ==== DYNLOG -DYNLOG- End of this file, rotating log\n"))
+	  || warn ("Cannot write to log file: $!");
+	&openlog (0);
+    };
+
+    ($sec, $usec) = gettimeofday();
+    @dateinfo = localtime ($sec);
+    if ($::Last_day != $dateinfo[7])
+    {
+	##  The day just changed
+	day_rollover();
+    };
+    $timestamp = join ("", sprintf ("%02d:%02d:%02d:%03d",
+				    $dateinfo[2],
+				    $dateinfo[1],
+				    $dateinfo[0],
+				    int ($usec / 1000)));
+    $out = join (" ",
+		 $timestamp,
+		 (($msg_level < 0) ? "====" :
+		  $::Msg_level_strings[$msg_level]),
+		 $msg);
+    (print ::LOGFH ($out))
+      || warn ("Cannot write to log file: $!");
+    $::Current_log_file_size += length ($out);
+};
+
+##  remove_client ($client_fh)
+##    Removes client from internal data structures
+##    (Does not affect system handles or log messages)
+sub remove_client
+{
+    my ($fh) = shift (@_);
+    my ($rows_to_delete, $table, $row, $row_map);
+
+    $rows_to_delete = $::Clients->{$fh}{"rows"};
+    delete $::Clients->{$fh};
+    @::Logclientfhs = grep ($::Clients->{$_}{"type"} eq "log",
+			    keys (%$::Clients));
+};
+
+sub usage
+{
+    my ($msg) = shift (@_);
+
+    $SIG{__DIE__} = "DEFAULT";
+    if (defined ($msg))
+    {
+	die ("dynlog: " . $msg . "\n");
+    }
+    else
+    {
+	die ("usage: dynlog [-U user] [-G group] [-fg]
+\t[-level loglevel] [-maxsize size] [dir]\n");
+    };
+};
+
+$::Loglevel = 4;
+@::Msg_level_strings = (
+			"EMRG",
+			"ALRT",
+			"CRIT",
+			"EROR",
+			"WARN",
+			"NOTI",
+			"INFO",
+			"DBUG"
+			);
+
+sub log_new_day
+{
+    my ($out);
+    my (@dateinfo) = localtime;
+    $out = join (" ",
+		 "============",
+		 "====",
+		 "DYNLOG",
+		 "-DYNLOG-",
+		 "Today is",
+		 sprintf ("%04d/%02d/%02d",
+			  $dateinfo[5] + 1900,
+			  $dateinfo[4] + 1,
+			  $dateinfo[3]
+			 )) . "\n";
+    (print ::LOGFH ($out))
+      || warn ("Cannot write to log file: $!");
+    $::Current_log_file_size += length ($out);
+};
+
+##  Handles all end-of-day processing
+##  including log message, yesterday
+##  data generation, and yesterday
+##  data caching.
+sub day_rollover
+{
+    my (@dateinfo);
+
+    @dateinfo = localtime;
+    $::Last_day = $dateinfo[7];
+
+    ##  Log message about the end of day
+    log_new_day();
+};
+
+sub main
+{
+    my ($ok, $msg, $loglisten_fh, $new_client, $msg_level, @events);
+    my ($client_spec, $client_fh, $data, $id, $arg, $fh, $line, @lines);
+    my ($payload, $prefix, @cachestat);
+    my ($msgnum, $msgtext, $user, $group, $user_id, $group_id, $foreground);
+    my ($pid, $pid_dir, $pid_file, $datumlist, $datum, @pwent);
+    my Cam::Scom::Event $event;
+    my Cam::Scom $scom = new Cam::Scom;
+
+    ##  Don't let SIGPIPE kill me
+    $::SIG{"PIPE"} = "IGNORE";
+
+    $::Scom = $scom;
+
+    $SIG{__DIE__} = sub { fail ($_[0]) };
+
+    ##  Get command line args
+    while (defined ($arg = shift (@::ARGV)))
+    {
+	if ($arg =~ /^-l/)
+	{
+	    defined ($::Loglevel = shift (@::ARGV)) || usage();
+	    ($::Loglevel =~ /^\d+$/) || usage();
+	    ($::Loglevel >= 0) && ($::Loglevel <= 7) || usage();
+	}
+	elsif ($arg =~ /^-m/)
+	{
+	    defined ($::Max_log_file_size = shift (@::ARGV)) || usage();
+	    ($::Max_log_file_size =~ /^\d+$/) || usage();
+	}
+	elsif ($arg =~ /^-U/)
+	{
+	    defined ($user = shift (@::ARGV)) || usage();
+	    if ($user =~ /^\d+$/)
+	    {
+		$user_id = $user;
+	    }
+	    else
+	    {
+		scalar (@pwent = getpwnam ($user))
+		  || usage ("user \"$user\" unknown");
+		$user_id = $pwent[2];
+	    };
+	}
+	elsif ($arg =~ /^-G/)
+	{
+	    defined ($group = shift (@::ARGV)) || usage();
+	    if ($group =~ /^\d+$/)
+	    {
+		$group_id = $group;
+	    }
+	    else
+	    {
+		scalar (@pwent = getgrnam ($group))
+		  || usage ("group \"$group\" unknown");
+		$group_id = $pwent[2];
+	    };
+	}
+	elsif ($arg eq "fg")
+	{
+	    $foreground = 1;
+	}
+	elsif ($arg =~ /^-/)
+	{
+	    usage();
+	}
+	elsif (! defined ($::Log_dir))
+	{
+	    $::Log_dir = $arg;
+	}
+	else
+	{
+	    usage();
+	};
+    };
+    defined ($::Log_dir)
+      || ($::Log_dir = "/var/log/dynlog");
+    $::Logfile = join ("/", $::Log_dir, "dynlog");
+
+    ##  Verify existence and ownership of log directory
+    (-e $::Log_dir)
+      && (! (-d $::Log_dir))
+	&& system ("rm", "-r", "-f", $::Log_dir);
+    (-d $::Log_dir)
+      || mkdir ($::Log_dir)
+	|| usage ("Cannot mkdir log directory $::Log_dir: $!");
+    scalar (@pwent = stat ($::Log_dir))
+      || usage ("Cannot stat log directory $::Log_dir: $!");
+    if ((defined ($user_id) && ($pwent[4] != $user_id)) ||
+	(defined ($group_id) && ($pwent[5] != $group_id)))
+    {
+	chown ($user_id, $group_id, $::Log_dir)
+	  || usage ("Cannot chown log directory $::Log_dir: $!");
+    };
+
+    ##  Fork daemon
+    if (! defined ($foreground))
+    {
+	##  Verify existence of PID directory
+	$pid_dir = "/var/run/dynlog";
+	$pid_file = join ("/", $pid_dir, "dynlog.pid");
+	(-e $pid_dir)
+	  && (! (-d $pid_dir))
+	    && system ("rm", "-r", "-f", $pid_dir);
+	(-d $pid_dir)
+	  || mkdir ($pid_dir)
+	    || die ("Cannot mkdir pid directory $pid_dir: $!\n");
+	open (::FH, ">$pid_file")
+	  && (print ::FH ("\n"))
+	    && close (::FH)
+	      || die ("Cannot write pid file $pid_file: $!\n");
+
+	POSIX::setsid();
+	chdir ($::Log_dir)
+	  || usage ("Cannot cd to log directory $::Log_dir: $!");
+	close (STDIN);
+	open (STDOUT, ">dynlog_proc.log")
+	  || usage ("Cannot open STDOUT to dynlog_proc.log for write: $!");
+	open (STDERR, ">&STDOUT")
+	  || usage ("Cannot open STDERR dup to STDOUT: $!");
+	defined ($pid = fork())
+	  || usage ("Cannot fork: $!");
+	if ($pid)
+	{
+	    ##  Write the pidfile
+	    open (::FH, ">$pid_file")
+	      && (print ::FH ("$pid\n"))
+		&& close (::FH)
+		  || die ("Cannot write pid file $pid_file: $!\n");
+	    exit;
+	};
+    };
+
+    ##  Step down from root
+    if (defined ($group_id))
+    {
+	($), $() = ($group_id, $group_id);
+    };
+    if (defined ($user_id))
+    {
+	($>, $<) = ($user_id, $user_id);
+    };
+
+    ##  Open the log file
+    openlog (1);
+    log_new_day();
+
+    ##  Establish the logging socket listener
+    $loglisten_fh = "::LOGLISTENER";
+    (($ok, $msg) = $scom->listen ($loglisten_fh, $::Log_port, "::LOGGER"))[0]
+      || die ($msg);
+
+    ##  Want to wake up once every 10 minutes to see if
+    ##  the day has rolled over
+    while (1)
+    {
+	@events = $scom->getevents (600);
+	while (defined ($datumlist = shift (@events)))
+	{
+	    $fh = shift (@$datumlist);
+	    while (defined ($datum = shift (@$datumlist)))
+	    {
+		if ($fh eq $loglisten_fh)
+		{
+		    ##  Got an event on the logging/status port listener
+		    $event = $datum;
+		    if ($event->{end})
+		    {
+			logit
+			  (2,
+			   "DYNLOG -DYNLOG- loglistener port stopped, code " .
+			   $event->{term});
+		    }
+		    else
+		    {
+			##  Got a new connection, register it
+			$new_client = $event->{port};
+			logit (6,
+			       "DYNLOG -DYNLOG- New Log Client connection " .
+			       "on fh = " . $new_client . "\n");
+			$::Clients->{$new_client} = {"initial" => 0,
+						   "type" => "log"};
+			(($ok, $msg) = $scom->register ("$new_client+"))[0]
+			  || warn ($msg);
+			@::Logclientfhs =
+			  grep ($::Clients->{$_}{"type"} eq "log",
+				keys (%$::Clients));
+
+			##  And send the current log level
+			$data = pack ("C", $::Loglevel);
+			if (! (($ok, $msg) =
+			       $scom->write ($new_client, $data))[0])
+			{
+			    logit
+			      (3,
+			       "DYNLOG -DYNLOG- Failed to write log level " .
+			       $::Loglevel . " to new log client at fh = " .
+			       $new_client . "\": $msg, terminating client\n");
+			    $::Scom->unregister ($new_client);
+			    remove_client ($new_client);
+			};
+		    };
+		}
+		elsif (defined ($client_spec = $::Clients->{$fh}))
+		{
+		    ##  Got an event from one of my clients
+		    if (ref ($datum))
+		    {
+			##  A client disconnected
+			$event = $datum;
+			logit(6, "DYNLOG -DYNLOG- " .
+			      $::Clients->{$fh}{"type"} .
+			      " client \"$fh\" disconnected " .
+			      (($event->{term} == -1) ?
+			       "because too slow" :
+			       ("code = " . $event->{term})) .
+			      "\n");
+			remove_client ($fh);
+		    }
+		    elsif ($::Clients->{$fh}{"type"} eq "log")
+		    {
+			if ($datum =~ /^\s*(\d+)\s*\r?\n$/)
+			{
+			    ##  It's a request for log level change
+			    $data = $1;
+			    if (($data >= 0) && ($data <= 7))
+			    {
+				$::Loglevel = $data;
+				logit
+				  (-1,
+				   "DYNLOG -DYNLOG- Changing log level to " .
+				   $::Msg_level_strings[$::Loglevel] .
+				   " ($::Loglevel)\n");
+				$data = pack ("C", $::Loglevel);
+				foreach $client_fh (@::Logclientfhs)
+				{
+				    if (!(($ok, $msg) =
+					  $scom->write ($client_fh, $data))[0])
+				    {
+					logit(3,
+					      "DYNLOG -DYNLOG- " .
+					      "Failed to write loglevel " .
+					      $::Loglevel .
+					      " to client \"$fh\": " .
+					      "$msg, terminating client\n");
+					$::Scom->unregister ($client_fh);
+					remove_client ($client_fh);
+				   };
+				};
+			    }
+			    else
+			    {
+				logit
+				  (4,
+				   "DYNLOG -DYNLOG- Invalid log level " .
+				   $data . "\n");
+			    };
+			}
+			else
+			{
+			    ##  It's a log message
+			    $::Clients->{$fh}{"initial"} = 1;
+			    ##  Have to replace \x01's with line breaks,
+			    ##  and strip off the message level number
+			    ##  and prefix (if any).
+			    ##  Also get rid of carriage returns.
+			    chomp ($datum);
+			    ##  Get the level
+			    if ($datum =~ /^(\d)/)
+			    {
+				$msg_level = $1;
+				($msg_level > 7) && ($msg_level = 7);
+				substr ($datum, 0, 1) = "";
+			    }
+			    else
+			    {
+				$msg_level = 7;
+			    };
+			    ##  Get the prefix
+			    if ($datum =~ /^([^\t]+)\t(.+)$/s)
+			    {
+				$prefix = $1;
+				$payload = $2;
+			    }
+			    else
+			    {
+				$prefix = "";
+			    };
+			    $payload =~ s/\r//sg;
+			    @lines = split (/\x01/, $payload);
+			    foreach $line (@lines)
+			    {
+				logit ($msg_level,
+				       join (" ", $prefix, $line . "\n"));
+			    };
+			};
+		    }
+		    else
+		    {
+			##  WTF?  We just got a message on a filehandle
+			##  with unknown type
+			logit (3, "DYNLOG -DYNLOG- Data from filehandle " .
+			       "\"$fh\" with unknown type\n");
+		    };
+		}
+		else
+		{
+		    ##  WTF?  We just got a message on an unknown filehandle
+		    logit (3, "DYNLOG -DYNLOG- Data from unknown filehandle " .
+			   "\"$fh\"\n");
+		};
+	    };
+	};
+
+	##  Check for day rollover
+	if ($::Last_day != (localtime)[7])
+	{
+	    day_rollover();
+	};
+    };
+};
+
+&main();

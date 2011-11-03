@@ -1,0 +1,24 @@
+Vxglue
+
+Vxglue is a set of routines that integrate with
+C/C++ language VXML implementations.
+
+INSTALLATION
+
+To install this module, run the following commands:
+
+    perl Build.PL
+    ./Build
+    ./Build test
+    ./Build install
+
+
+SUPPORT AND DOCUMENTATION
+
+Look at voiceglue.org for further information.
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2007 Doug Campbell
+
+This program is released under the following license: gpl

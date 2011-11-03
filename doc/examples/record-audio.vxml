@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>  <!-- -*-SGML-*- -->
+<vxml version = "2.0" xmlns="http://www.w3.org/2001/vxml">
+
+<form id="top">
+  <property name="inputmodes" value="dtmf"/>
+  <record name="r" beep="true" maxtime="10s" finalsilence="3s" dtmfterm="true"
+  type="audio/basic">
+    <prompt>
+      Make a recording after the beep.
+    </prompt>
+    <noinput>
+      <prompt>I did not hear anything.  Please try again.</prompt>
+      <goto next="#top"/>
+    </noinput>
+    <filled>
+      <if cond="r$.maxtime == true">
+        <prompt bargein="false"> You hit the maximum recording time. </prompt>
+      </if>
+      <if cond="((typeof r$.termchar) != 'undefined') &amp;&amp; (String (r$.termchar) != 'null')">
+        <prompt bargein="false">
+	  You stopped recording with key <value expr="r$.termchar"/> .
+        </prompt>
+      </if>
+      <prompt bargein="false">
+	Your recording lasted <value expr="r$.duration"/> milliseconds
+	and took <value expr="r$.size"/> bytes.
+      </prompt>
+      <prompt bargein="false">Your recording was</prompt>
+      <prompt bargein="false">
+        <audio expr="r"/>
+      </prompt>
+      <goto next="#top"/>
+    </filled> 
+  </record>
+</form>
+
+</vxml>

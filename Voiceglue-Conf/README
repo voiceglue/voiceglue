@@ -1,0 +1,40 @@
+Voiceglue-Conf
+
+Support for reading/writing the voiceglue configuration file
+/etc/voiceglue.conf
+
+INSTALLATION
+
+To install this module, run the following commands:
+
+	perl Build.PL
+	./Build
+	./Build test
+	./Build install
+
+SUPPORT AND DOCUMENTATION
+
+After installing, you can find documentation for this module with the
+perldoc command.
+
+    perldoc Voiceglue::Conf
+
+COPYRIGHT AND LICENCE
+
+    Copyright (C) 2009 Ampersand Inc., and Doug Campbell
+
+    This file is part of Satc.
+
+    Satc is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 3 of the License, or
+    (at your option) any later version.
+
+    Satc is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with Satc; if not, see <http://www.gnu.org/licenses/>.
+

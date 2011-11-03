@@ -1,0 +1,224 @@
+Version 3.4 (August 1 2005)
+===============================================================================
+1) Duplicate property elements would be ignored.  Now, the last property element
+   replaces previous ones.  For example:
+
+      <property name="inputmodes" value="voice dtmf"/>
+      <property name="inputmodes" value="dtmf"/>
+
+   Will result in "inputmodes" being equal to "dtmf".  Previously, only the first
+   property was used.
+
+2) According to the spec, event handlers are responsible for queueing prompts,
+   and the next iteration does not perform prompt selection unless the event
+   handler includes <reprompt>.  However, there was a bug were reprompt was
+   effectively being called.
+
+3) Removed requirement to use DOCTYPE.
+
+4) For multipart HTTP messages, the filename parameter is not included for parts 
+   not requiring it.  Also, the filename parameter value is now quoted when 
+   present.
+
+5) On the grammar element, both 'src' and 'srcexpr' were being allowed.
+
+6) Document level <data> elements were not being processed.
+
+7) Was not handling multiple data elements in the same VXML script correctly.
+   A temporary solution was used, and a future version will likely change the
+   way DOM parsing is handled.
+
+8) Changed DOM class names to be consistent with the spec.  Previously, the 
+   class names were prefixed with "DOM".  For example "DOMNode" instead of 
+   just "Node".  With the "DOM" prefix, some of the 2.1 IR tests would fail.
+
+9) DOM Node.ownerDocument was not returning the same script Document object as
+   the data element variable (2.1 IR test 57).  For example:
+      <data name="dom" src="..."/>
+      var owner = dom.documentElement.firstChild.ownerDocument;
+      if (owner != dom) test_failed;
+
+10) DOM Attrib.ownerElement was not returning the same script Element object as
+    it's owning Element (2.1 IR test 76).  For example:
+       <data name="dom" src="..." />
+       var root = dom.documentElement;
+       var child = root.lastChild;
+       var someAttr = child.attributes.item(0);
+       if (someAttr.ownerElement != child) test_failed;
+
+11) For Consultation transfers that end with an unknown result, the field item
+    is set to "unknown".  Previously, OpenVXI was throwing a disconnect.transfer
+    event.
+
+12) Now handling mark variables after a Record with no NLSML result.
+
+13) The previous version was not handling prompt elements nested within a
+    foreach element.  This version corrects that.
+
+14) Grammars were not always being Deactivated prior to being Free'd.
+
+15) An undeclared variable in the namelist of an exit element was not throwing
+    and error.semantic event.
+
+16) If the transfer 'type' and 'bridge' attributes were not specified, the 
+    connection.disconnect.transfer event was not being thrown.
+
+17) Fixed potential memory leak in VXI::object_element where the VXIMap
+    'parameters' would not be destroyed in the case of an error.
+
+18) Fixed potential memory leak in VXI::subdialog_element where the VXIMap
+    'params' would not be destroyed in the case of an error, or unexpected
+    exception.
+
+19) The previous version was not always scoping the data element variable
+    correctly.
+
+20) The previous version was not setting the recordutterance variable after
+    a recognition during a transfer.
+
+
+Features:
+===============================================================================
+1) Added support for the data fetch properties (2.1 Candidate Rec 13 Jun 2005)
+
+
+Known Limitations:
+===============================================================================
+1) Due to some optimizations in prompt handling, OpenVXI does not support 
+   nested foreach elements.  This will be corrected in a future release.
+
+
+Version 3.3a (June 1, 2005)
+===============================================================================
+1) Corrected build problems on Windows using STLPort.
+
+Version 3.3 (June 1, 2005)
+===============================================================================
+1) Added support for the VXML 2.1 (Working Draft 28 July 2004):
+   a) For the <data> element, the platform can set the default authorization 
+      when the ?access-control? is not specified.  
+
+      This is done by setting the VXI_DEFAULT_ACCESS_CONTROL property in a call 
+      to VXIinterpreterInterface::SetProperties. This property is a VXIInteger, 
+      where 0 (the default) will deny access, and 1 allows access.
+
+2) VXItelInterface::Disconnect has been changed to include a VXIMap to hold the 
+   new "namelist" attribute values on the <disconnect> element.
+
+3) Changes to support mark tracking:
+   a) VXIrecRecognitionResult, VXIrecTransferResult and VXIrecRecordResult now 
+      have fields for "markname" and "marktime".  These have been added to 
+      support the mark tracking feature.
+   b) Neither of the new fields are used in this pre-release.  When returning 
+      any of these structures to OpenVXI, the "markname" field should be set 
+      to NULL.
+      
+4) Must set the DOCTYPE in the VXML document to:
+	<!DOCTYPE vxml PUBLIC "-//W3C//DTD VOICEXML 2.1//EN" 
+	    "http://www.w3.org/TR/voicexml21/vxml.dtd"> 
+
+5) The function VXIrecInterface::SupportsHotwordTransfer has been added.  This
+   method should indicate whether hotword transfers are supported.  Previously,
+   a call to HotwordTransfer that resulted in VXIrec_RESULT_UNSUPPORTED would 
+   cause the transfer to take place on the VXItelInterface.  This is no longer
+   the case, and integrators should instead use this new method to indicate 
+   support.
+
+6) The expected behavior of VXIrecInterface::HotwordTransfer has changed.  
+   Previously, only bridged transfers were handled by this function.  Now, 
+   HotwordTransfer should also be prepared to handle consulation transfers as 
+   well.  This is because during audio playback, and up to the point the call 
+   connects (or fails to connect), the user can use speech or DTMF to cancel 
+   the transfer.  The type of the transfer is passed in the 'properties' 
+   argument of HotwordTransfer in the TEL_TRANSFER_TYPE key, and will have a 
+   value of "consultation" or "bridge".
+
+7) The function VXItelInterface::TransferConsultation has been added.
+
+8) A new transfer status value of VXItel_TRANSFER_CALLER_HANGUP has been added.  
+   This should be used to indicate that the caller hang up the line during the 
+   transfer.  Previously, OpenVXI would call VXItelInterface::GetStatus to 
+   determine this.  However, there was some ambiguity due to some platform 
+   implementations causing the callers line to go on-hook during the normal
+   process of performing the transfer (e.g. during a blind transfer).  
+   Depending on the implementation, this could cause OpenVXI to throw the wrong 
+   event.
+
+9) A function has been added to the JSI interface to retrieve detailed error
+   information.  Unless an integrator has implemented their own JSI module, 
+   this will not effect customer platforms.
+
+10) OpenVXI will now activate grammars in the order of precedence, according 
+    to spec section "3.1.4 Activation of Grammars".  Previously, OpenVXI would
+    activate them in document order.
+
+11) application.waveform$ is no longer set by OpenVXI.  The record utterance 
+    feature replaces this var.  i.e., Applications that used this var should 
+    instead enable recordutterance, and use the lastresult$.recording var.
+
+Bug fixes:
+1) If an error occurred during form initialization, and there was a form or 
+   document level event handler that didn't result in an exit, OpenVXI could 
+   fall into an infinite loop.  Some examples of possible errors are duplicate 
+   form item names, <var> elements with illegal names, and a <data> element 
+   that resulted in an event.
+   
+2) Previous versions of OpenVXI would not listen for user input while playing 
+   prompts for a <transfer> element.  i.e., Grammars would be activated 
+   correctly, and prompts queued and played, but the various transfer functions
+   would not be called until the prompts were completely played.
+   
+3) According to the VXML spec, <script>y = 5;</script> should throw an 
+   error.semantic event since "y" had not been declared.  Previous versions of 
+   OpenVXI were not doing this (though using <assign> and specifying an 
+   undeclared variable was working correctly).
+   
+4) OpenVXI was incorrectly considering an undeclared field of an object to be 
+   declared.  For example, com.obj.field1 (where field1 was not declared) would
+   be considered declared.
+   
+5) When recordutterance was enabled for an <initial> element, OpenVXI would 
+   throw an error.semantic event when it attempted to set the shadow vars on 
+   the element. 
+
+6) Corrected buffer overrun in VXIclient Record.
+
+
+
+Version 3.2 (April 30, 2005):
+===============================================================================
+1)  While having passed the compliance tests concerning Event counting,
+    there were several scenarios where the number of times an event had
+    been thrown was not being tracked correctly.
+2)  Various places in the code would not compile using Linux GCC 3.4.x.
+    Minor corrections were made to allow compilation, and should not
+    otherwise effect behavior of OpenVXI.
+3)  <record> elements would occasionally throw an exception due to a NULL
+    pointer being accessed.
+4)  ValidateDoc was not compiling under Linux due to some Windows
+    dependancies.
+5)  Child prompts of an <object> element were being queued, but not played.
+6)  Changed Windows builds to not include debug information in release 
+    builds.
+7)  Removed SpiderMonkey patch from distribution.  These patches are not
+    needed with the latest SpiderMonkey release.
+8)  Inserting external events was not working correctly (using the
+    VXIinterpreterInterface::InsertEvent, or the VXIinterpreterInsertEvent 
+    calls).
+9)  Multiple NBest answers were not being handled correctly.
+
+Features:
+1)  The record utterance feature (from the VoiceXML 2.1 spec) added.  The
+    VXIrecRecognitionResult and VXIrecTransferResult structures have two
+    new fields ("utterance" and "utteranceDuration") that the Rec modules 
+    may supply after a recognition.  The VXIrecRecognitionResult.waveform 
+    field has been removed.
+    
+2)  The original document encoding is passed to Rec and Prompt so that the
+    integrator could re-encode the document with the original encoding (if
+    needed).  The original encoding is passed via the properties map, in 
+    the key " encoding".
+    
+3)  When parsing/creating SSML or Grammar documents, OpenVXI will retain
+    CDATA sections.  Previously, the CDATA tags would be dropped, and the
+    content encoded.

@@ -1,0 +1,288 @@
+# PRODUCT_DOC
+#
+# Copyright 2004 Vocalocity, Inc. All Rights Reserved.
+#
+# Make definitions common to all NT make files
+#
+# Used by: all NT make files
+#
+#
+#----------------
+#
+# Platform macros
+#
+# NOTE: By default nmake sets a variable called $(OS) to indicate the
+# exact Windows variant. This SWI build system overrides $(OS) to
+# simply indicate "win32", and in some rare cases this messes up our
+# ability to invoke third party makefiles or Microsoft Visual Studio
+# Project Files to delegate builds. Thus we use $(SWIOS) within this
+# build system, set $(OS) only for external use in actual Makefiles,
+# and allow users to set SUPRESS_OS_SET to suppress this variable
+# override in those rare cases.
+#
+#----------------
+!ifndef PROCESSOR_ARCHITECTURE
+!error I think you're not using NT. NT defines a PROCESSOR_ARCHITECTURE env. var.
+!elseif "$(PROCESSOR_ARCHITECTURE)" != "x86"
+!error This is not an Intel architecture machine. This makefile expects Intel.
+!else
+SWISBSDK = $(SWISBSDK:/=\)   # make the env. var friendly to dos commands
+CPU=i386
+SWIOS=win32
+PLATFORM=$(CPU)-$(SWIOS)
+!ifndef SUPRESS_OS_SET
+OS=$(SWIOS)
+!endif
+!endif
+
+#====================================================================
+# Tools
+#====================================================================
+BISON = bison -d
+CC = cl
+MTL = midl.exe
+FLEX = flex
+LIBRARIAN = lib
+LNK = link
+YACC = yacc
+DOCXX = docxx
+DOCIFY = docify
+PERL = perl
+
+#====================================================================
+# Directories
+#====================================================================
+BUILD_ROOT = build
+BUILD_ROOT_PLT = $(BUILD_ROOT)\$(PLATFORM)
+BUILDDIR = $(BUILD_ROOT_PLT)\$(CFG)
+PLATFORMDIR = $(PROJ_ROOT)\$(PLATFORM)
+MAKEDIRLIST = $(BUILD_ROOT) $(BUILD_ROOT_PLT) $(BUILDDIR) $(BUILDSUBDIRS)
+
+#====================================================================
+# Files
+#====================================================================
+!ifndef MAKEFILE
+MAKEFILE = Makefile.NT
+!endif
+
+#====================================================================
+# Librarian flags
+#====================================================================
+# nologo         suppresses the title and copyright banner
+# machine:IX86   tells the librarian this is for intel machines
+# out:           specifies the output file
+LIBRARIAN_FLAGS = \
+        -nologo \
+        -machine:IX86 \
+        -OUT:$@
+
+#====================================================================
+# Browse info-maker flags
+#====================================================================
+BROWSE_FLAGS = -nologo -n -o $@
+
+#====================================================================
+# C/C++ compiler flags
+#====================================================================
+# nologo     suppresses the title and copyright banner
+# c          only compile - don't link
+# W3         use warning level 3
+# YX         use precompiled headers
+# Fp<file>   use <file> for precompiled header data file name
+# Fo<file>   output file name is <file>
+# Zi         store debug info in a program database file
+# Fd<file>   use <file> for program database file name
+CFLAGS_GENERAL = \
+        -nologo -c \
+!if defined(STRICT)
+	      -W4 \
+!else
+	      -W3 \
+!endif
+        -DWIN32 \
+        -D_$(CPU)_ \
+        -D_$(SWIOS)_ \
+        -D__THREADED \
+        -YX -Fp$(TARGET).pch \
+        -Fo$@ \
+!if defined(BROWSE)
+	      -Fr$*.sbr \
+!endif
+# First get include directories, then other headers from this project
+# and only then include SWISBSDK files.
+        -I$(PROJ_ROOT)\$(PLATFORM)\include \
+        -I$(PROJ_ROOT)\include \
+        $(PROJ_CFLAGS) \
+	      -I"$(SWISBSDK)\include"
+
+# /Od  disable optimizations
+# /MDd use the multi-threaded, DLL, debug version of the run-time library
+CFLAGS_DEBUG = -D_DEBUG -Od -MDd -Zi -Fd$(TARGET).pdb
+
+# /O2  optimize for speed
+# /G6  generate code for Pentium Pro
+# /MD  use the multi-threaded, DLL version of the run-time library
+CFLAGS_RELEASE = -DNDEBUG -O2 -G6 -MD
+
+#====================================================================
+# Linker flags
+#====================================================================
+# nologo           suppresses the title and copyright banner
+# machine:IX86     tells the librarian this is for intel machines
+# incremental:no   turns off incremental linking
+# map              generates a map file
+# out:             specifies the output file
+# debug            tells the linker this is a debug build
+# pdb:<file>       use <file> for the program database
+# release          generates a checksum in the image header
+
+LNKFLAGS = \
+        -nologo -machine:I386 -incremental:no -fixed:no -MAP \
+        kernel32.lib user32.lib advapi32.lib \
+        -out:$@ \
+!if "$(CFG)" == "debug"
+        -debug -pdb:$*.pdb \
+!endif
+        -release \
+	      -libpath:"$(SWISBSDK)\lib" \
+!if defined(PROFILE)
+	      -profile \
+!endif
+!if defined(PURIFY)
+# Suppress Purify warning messages when using the tool
+	      -fixed:no \
+!endif
+!if defined(ALTMON)
+# For use internally by Vocalocity crash information
+	      $(PRODUCT_LIB_PREFIX)mon$(CFG_SUFFIX).lib -INCLUDE:_ALTmonAttach@0 \
+!endif
+!if "$(TARGET_LIBS)" == ""
+        $(PROJ_LIBS) \
+!else
+        $(TARGET_LIBS) \
+!endif
+	      $(MYLFLAGS)
+
+#====================================================================
+# Resource compiler flags
+#====================================================================
+# l <lang-id>   use the language specified by <lang-id>
+# Fo<file>      use <file> for output file name
+RFLAGS = $(PROJ_RFLAGS) -I"$(SWISBSDK)\include" -l 0x409 -Fo$@
+
+#====================================================================
+# IDL compiler flags
+#====================================================================
+# /Oicf         generate stubless proxies
+MTLFLAGS = $(PROJ_MTLFLAGS) /Oicf
+
+#====================================================================
+# Message compiler flags
+#====================================================================
+# b             prefix the .bin file name with the source file name
+# h             set the directory for the generated header
+# r             set the directory for the generated .bin and .rc files
+MFLAGS = -b -h $(BUILDDIR) -r $(BUILDDIR)
+
+#====================================================================
+# Set up macros for different config's
+#====================================================================
+!if "$(CFG)" == ""
+CFG=debug
+!message CFG not defined. Defaulting to debug.
+!endif
+
+!if "$(CFG)" == "debug"
+CFG_SUFFIX = D
+CFLAGS_CFG = $(CFLAGS_DEBUG)
+!elseif "$(CFG)" == "release"
+CFG_SUFFIX =
+CFLAGS_CFG = $(CFLAGS_RELEASE)
+!else
+!error variable CFG = $(CFG) is not a legal config type.
+!endif
+
+#====================================================================
+# STL library flags
+#====================================================================
+
+# The SWI standard Standard C++ Library (a.k.a. STL) is STLport,
+# which implements the ISO C++ standard, as does the GNU GCC 3.x
+# compilers we use on Unix. The STL that comes with Microsoft Visual
+# C++ is a very old version of Dinkumware that does not implement that
+# standard, and has significant known defects. By default, STLport library
+# gets used by detecting if STLPORTDIR gets set. If STLPORTDIR isn't either set
+# or found then MSVC library gets used. You can also select Microsoft Visual C++ 
+# by defining MSVC_STL=1, and you can opt for no STL by defining NO_STL=1 
+# (really gives you Microsoft Visual C++ STL since there's no way to disable
+# that, but adds a NO_STL define to request your code to use non-STL
+# based implementations when available).
+#
+# Detecting STLport libraries
+!ifdef STLPORTDIR
+STL_INCLUDE_PATH = "$(STLPORTDIR)\stlport"
+STL_LIBRARY_CFLAGS = -I$(STL_INCLUDE_PATH) -DSTL_PORT
+
+!if "$(CFG)" == "debug"
+
+!if exist ("$(STLPORTDIR)\lib\stlport_vc6_stldebug.lib")
+STL_LIBRARY_LIBS = "$(STLPORTDIR)\lib\stlport_vc6_stldebug.lib"
+CFLAGS_DEBUG = $(CFLAGS_DEBUG) -D_STLP_DEBUG -D_STLP_USE_DEBUG_LIB -D_STLP_USE_EXCEPTIONS
+!else
+!error "Unable to find 'stlport_vc6_stldebug.lib' library file."
+!endif
+
+!elseif "$(CFG)" == "release"
+
+!if exist ("$(STLPORTDIR)\lib\stlport_vc6.lib")
+STL_LIBRARY_LIBS = "$(STLPORTDIR)\lib\stlport_vc6.lib"
+!else
+!error "Unable to find 'stlport_vc6.lib' library file."
+!endif
+
+!endif
+
+!else
+MSVC_STL = 1
+!endif
+
+!ifdef NO_STL
+STL_INCLUDE_PATH =
+STL_LIBRARY_PATH =
+STL_LIBRARY_CFLAGS = -DNO_STL
+!else
+!ifdef MSVC_STL
+STL_LIBRARY_CFLAGS = -DSWI_MSVC_STL
+!endif
+!endif
+
+#====================================================================
+# Set up macros for different target type's
+#====================================================================
+# dll                tells the linker to generate a DLL
+# implib:<file>      generates an import library named <file>
+# def:<file>         uses the module definition file specified by <file>
+LNKFLAGS_DLL = \
+        -dll \
+        -implib:$*.lib \
+!if "$(NO_DEF_FILES)" == ""
+        -def:$(TARGET_DEF) \
+!endif
+	      $(STL_LIBRARY_LIBS)
+
+# /subsystem:console      runs under the console subsystem (obsolete?)
+LNKFLAGS_CONSOLE = -subsystem:console $(STL_LIBRARY_LIBS)
+LIBRARIANFLAGS_LIB =
+
+#====================================================================
+# Set final values for these macros
+#====================================================================
+# we define __STDC__ here as a kludge. We'd like to enforce ANSI code (the
+# /Za option) which would implicitly define __STDC__ but this creates all sorts
+# of errors/warnings in Microsoft's own windows.h header file.
+CFLAGS = -D__STDC__=1 $(CFLAGS_CFG) $(CFLAGS_GENERAL) $(MYCFLAGS)
+
+# GX    enables C++ exception handling
+# TP    forces the source file to be compiled as C++
+CPPFLAGS = -GX -TP $(CFLAGS_CFG) $(CFLAGS_GENERAL) $(STL_LIBRARY_CFLAGS) \
+	          $(MYCFLAGS)
