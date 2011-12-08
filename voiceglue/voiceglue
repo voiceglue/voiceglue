@@ -174,7 +174,7 @@ $::Clients = {};
 ##                 {"path"}         -- file path to give SATC server or DTMFs
 ##    ->{"play_requested"} -- if defined, VXML requested a play of prompts
 ##                            that has not yet completed (due to a wait,
-##                            recognize, or record being sent)
+##                            recognize, record, or transfer being sent)
 ##    ->{"wait_requested"} -- if defined, VXML requested a wait 'till play done
 ##    ->{"recognize_requested"}  -- if defined, VXML requested a recognition
 ##                                  that has not yet completed.
@@ -2537,7 +2537,6 @@ sub handle_ovxi_play
     my ($fhinfo) = shift (@_);
     my ($ovximsg) = shift (@_);
 
-    $fhinfo->{"play_requested"} = 1;
     ##  Don't actually start the play.
     ##  The actual play will start on a subsequent
     ##  recognize, record, or wait message.
@@ -2563,9 +2562,9 @@ sub handle_ovxi_wait
     ##  If a play has been requested and there are files to
     ##  play, we have to play them (no bargein assumed)
     ##  Update vxml_doing
-    if ((defined ($fhinfo->{"play_requested"})) &&
-	(defined ($fhinfo->{"play_queued"})))
+    if (defined ($fhinfo->{"play_queued"}))
     {
+	$fhinfo->{"play_requested"} = 1;
 	$fhinfo->{"vxml_doing"} = $ovximsg->{"msgtype"};
 	$fhinfo->{"wait_requested"} = 1;
 	do_prompt_and_listen ($fhinfo);

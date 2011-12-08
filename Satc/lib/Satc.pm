@@ -59,8 +59,8 @@ encoding and decoding SATC messages.
 
 =head2 Message Representation
 
-A SATC message is represented by a simple hashref mapping field names
-to their values.  The field types, field names, and the field name
+A SATC message is represented in perl by a simple hashref mapping field
+names to their values.  The field types, field names, and the field name
 constant definitions are as follows:
 
     type     field        fieldname-constant
