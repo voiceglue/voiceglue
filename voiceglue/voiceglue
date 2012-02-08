@@ -456,6 +456,7 @@ sub clean_url_path
 	elsif (($components[$i] eq "..") && ($i > 0))
 	{
 	    splice (@components, $i-1, 2);
+	    $i--;
 	}
 	else
 	{
