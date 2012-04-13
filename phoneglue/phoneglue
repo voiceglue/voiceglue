@@ -1478,7 +1478,7 @@ sub send_agi_client_msg
 	$bytes = join (" ",
 		       "EXEC",
 		       "Dial",
-		       "\"" . join ("|",
+		       "\"" . join (",",
 				    $agimsg->{"url"},
 				    $timeout,
 				    $agimsg->{"bridged"} ? "go" : "o",
