@@ -161,7 +161,7 @@ sub verify_prerequisites
 		   );
     }
     elsif (($::Release eq "ubuntu") &&
-	   ($::Major >= 10))
+	   ($::Major == 10))
     {
 	@prereqs = (
 		    "gcc",
@@ -179,6 +179,26 @@ sub verify_prerequisites
 		    "pkg-config",
 		    "libsox-fmt-base"
 		   );
+    }
+    elsif (($::Release eq "ubuntu") &&
+           ($::Major == 11) && ($::Minor == 4))
+    {
+        @prereqs = (
+                    "gcc",
+                    "g++",
+                    "libxerces-c2-dev",
+                    "xulrunner-1.9.2-dev",
+                    "flite",
+                    "sox",
+                    "curl",
+                    "libssl-dev",
+                    "libxml-libxml-perl",
+                    "libbsd-resource-perl",
+                    "libmodule-build-perl",
+                    "liburi-perl",
+                    "pkg-config",
+                    "libsox-fmt-base"
+                   );
     }
     elsif ($::Release eq "fedora")
     {
@@ -236,7 +256,7 @@ sub verify_prerequisites
     {
 	die ("Cannot install voiceglue until the " .
 	     "following prerequisite packages are installed: " .
-	    join (", ", @prereqs_missing));
+	    join (" ", @prereqs_missing));
     };
 
     $spew = `asterisk -V`;
